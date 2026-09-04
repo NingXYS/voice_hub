@@ -1,0 +1,5 @@
+url: ws://127.0.0.1:8765
+robot_id: tianlian_dual
+schema_version: 1
+audio_device: default
+aplay_device: default

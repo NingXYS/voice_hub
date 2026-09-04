@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Voice Hub 设备端
+Comment=连接语音主机，打字试音
+Exec=@ROOT@/scripts/run_device_ui.sh
+Icon=audio-headset
+Terminal=false
+Type=Application
+Categories=AudioVideo;Utility;
+StartupNotify=true

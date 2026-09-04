@@ -1,0 +1,6 @@
+id: example_arm
+name: 示例机械臂
+schema_version: 1
+ack_text: 好的，正在执行
+tools: []
+knowledge_file: knowledge.yaml

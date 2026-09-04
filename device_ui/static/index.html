@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Hub 设备端</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>Voice Hub 设备端</h1>
+      <p class="lead">连到电脑上的语音主机。密钥在主机上，这里只填地址。</p>
+    </header>
+
+    <section class="card">
+      <div class="row between">
+        <h2>连接</h2>
+        <span id="lamp" class="lamp off">未连接</span>
+      </div>
+      <label>主机地址
+        <input id="url" type="text" spellcheck="false" placeholder="ws://10.101.67.111:8765" />
+      </label>
+      <div class="row">
+        <label class="grow">机械臂 robot_id
+          <input id="robot" type="text" list="robots" />
+          <datalist id="robots">
+            <option value="tianlian_dual"></option>
+            <option value="demo_single"></option>
+          </datalist>
+        </label>
+        <label>协议版本
+          <input id="schema" type="number" min="1" step="1" />
+        </label>
+      </div>
+      <p id="warn" class="warn" hidden></p>
+      <div class="row">
+        <button id="save" type="button">保存</button>
+        <button id="connect" type="button" class="primary">连接</button>
+        <button id="disconnect" type="button">断开</button>
+      </div>
+      <p id="connMsg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2>连续对话</h2>
+      <p class="hint">浏览器用本机麦克风，说完会自动停，回复播完后再听（播放时不抢话，避免喇叭回声打断）。点一次开始，再点结束。</p>
+      <div class="row">
+        <button id="talk" type="button" class="primary" disabled>开始连续对话</button>
+        <span id="phase" class="lamp off">未开始</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>记忆</h2>
+      <p class="hint">记住的城市、称呼和最近几轮对话存在<strong>主机</strong>上，按机械臂区分。改完点保存立即生效。</p>
+      <div class="row">
+        <label class="grow">城市
+          <input id="memCity" type="text" placeholder="例如：长春" />
+        </label>
+        <label class="grow">称呼
+          <input id="memName" type="text" placeholder="可选" />
+        </label>
+      </div>
+      <p id="memPath" class="hint"></p>
+      <ol id="memTurns" class="log"></ol>
+      <div class="row">
+        <button id="memLoad" type="button">刷新</button>
+        <button id="memSave" type="button" class="primary">保存记忆</button>
+        <button id="memClear" type="button">清空记忆</button>
+      </div>
+      <p id="memMsg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2>打字试音</h2>
+      <textarea id="text" rows="3" maxlength="400" placeholder="例如：北京天气怎么样（Ctrl+Enter 发送）"></textarea>
+      <div class="row">
+        <button id="say" type="button" class="primary">发送并播放</button>
+        <button id="stop" type="button" disabled>停止</button>
+      </div>
+      <audio id="player" controls></audio>
+      <ol id="events" class="log"></ol>
+    </section>
+
+    <section class="card help">
+      <h2>怎么连</h2>
+      <ul>
+        <li>设备和主机要在<strong>同一 Wi‑Fi / 同一网段</strong>（或 Tailscale）。不要做公网端口转发。</li>
+        <li>主机先运行 <code>bash scripts/run_server.sh</code>。</li>
+        <li>地址填主机局域网 IP，例如 <code>ws://10.101.67.111:8765</code>。不要填 <code>127.0.0.1</code>（那是这台设备自己），也不要填 <code>198.18.x</code>（Clash 假 IP）。</li>
+        <li>换一台 Linux：拷这份程序，只改上面的主机 IP。</li>
+      </ul>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

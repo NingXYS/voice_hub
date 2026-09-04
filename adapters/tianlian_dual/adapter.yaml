@@ -1,0 +1,20 @@
+id: tianlian_dual
+name: 施耐力双臂
+wake_word: 小西小西
+schema_version: 1
+capabilities:
+  arms: [left, right]
+  joints_per_arm: 6
+  actions: [move_cartesian, move_joint, home, get_status]
+safety:
+  max_cartesian_m: 1.0
+  max_joint_rad: 3.1416
+  require_arm: true
+  no_default_distance: true
+tools:
+  - name: move_cartesian
+    description: 左右臂按米做相对空间移动
+  - name: move_joint
+    description: 指定 1-6 关节相对旋转，单位弧度
+knowledge_file: knowledge.yaml
+ack_text: 好的，正在执行

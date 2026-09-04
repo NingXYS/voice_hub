@@ -1,0 +1,8 @@
+id: demo_single
+name: 演示单臂
+schema_version: 1
+ack_text: 好的，单臂开始动
+tools:
+  - name: jog
+    description: 单轴点动，单位毫米，字段为 cmd/axis/mm
+knowledge_file: knowledge.yaml
