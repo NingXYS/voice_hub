@@ -141,6 +141,23 @@ class RealtimeProtocolTests(unittest.TestCase):
         self.assertEqual(audio.kind, "audio")
         self.assertEqual(audio.pcm, pcm)
 
+    def test_hold_drops_default_audio_until_chat_tts(self):
+        from server.providers.realtime_doubao import DoubaoRealtimeSession, RealtimeEvent
+
+        session = DoubaoRealtimeSession()
+        session._hold_default_audio = True
+        auto = RealtimeEvent(kind="audio", pcm=b"\x01\x00", tts_type="")
+        self.assertFalse(session._accept_dialog_output(auto))
+        self.assertTrue(session._hold_default_audio)
+        caption = RealtimeEvent(kind="text", text="我查一下。", tts_type="chat_tts_text")
+        self.assertTrue(session._accept_dialog_output(caption))
+        self.assertFalse(session._hold_default_audio)
+        follow = RealtimeEvent(kind="audio", pcm=b"\x02\x00", tts_type="")
+        self.assertTrue(session._accept_dialog_output(follow))
+        session.mute()
+        self.assertFalse(session._accept_dialog_output(follow))
+        self.assertTrue(session._accept_dialog_output(RealtimeEvent(kind="ended")))
+
     def test_chat_tts_text_sends_start_then_end(self):
         import asyncio
 

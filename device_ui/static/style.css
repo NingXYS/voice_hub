@@ -78,4 +78,17 @@ audio { width: 100%; margin-top: 12px; }
   font-size: 14px;
 }
 code { color: #c5d4ff; }
+.arm-json {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #12141a;
+  color: #c5d4ff;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 160px;
+  overflow: auto;
+}
 .help ul { margin: 0; padding-left: 20px; }

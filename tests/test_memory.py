@@ -47,6 +47,8 @@ class MemoryTests(unittest.TestCase):
         today = search_query("长春天气怎么样", now=now, city="长春")
         self.assertIn("2026年8月31日", today)
         self.assertNotIn("景点", today)
+        autumn = search_query("几天到中秋节", now=now, city="长春")
+        self.assertNotIn("长春", autumn)
 
     def test_idempotent_observe(self):
         mem = ConversationMemory(robot_id="x")

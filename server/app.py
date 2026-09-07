@@ -100,7 +100,22 @@ class VoiceHub:
                 return
             speaking = True
             try:
-                await self._turn(adapter, spoken_text, token, send_json, send_bin, memory=memory, dialog=dialog)
+                async def refresh_dialog():
+                    nonlocal dialog
+                    await close_dialog()
+                    dialog = await ensure_dialog()
+                    return dialog
+
+                await self._turn(
+                    adapter,
+                    spoken_text,
+                    token,
+                    send_json,
+                    send_bin,
+                    memory=memory,
+                    dialog=dialog,
+                    refresh_dialog=refresh_dialog,
+                )
             except Exception as exc:
                 print(f"⚠️ turn failed: {type(exc).__name__}: {exc}", flush=True)
                 try:
@@ -163,6 +178,8 @@ class VoiceHub:
             if dialog is not None and dialog.alive:
                 if not wanted_city or getattr(dialog, "city", "") == wanted_city:
                     return dialog
+                await close_dialog()
+            elif dialog is not None:
                 await close_dialog()
             factory = self.realtime_factory
             if factory is None and config.dialog_configured():
@@ -414,6 +431,7 @@ class VoiceHub:
         send_bin: Callable,
         memory: ConversationMemory | None = None,
         dialog: DoubaoRealtimeSession | None = None,
+        refresh_dialog=None,
     ) -> None:
         started = time.monotonic()
         first_audio_logged = False
@@ -450,7 +468,30 @@ class VoiceHub:
                 )
                 return
             except Exception as exc:
-                print(f"⚠️ dialog turn failed ({type(exc).__name__}: {exc}); cascade", flush=True)
+                print(f"⚠️ dialog turn failed ({type(exc).__name__}: {exc}); retry", flush=True)
+                if callable(refresh_dialog) and not abort.is_set():
+                    try:
+                        dialog = await refresh_dialog()
+                    except Exception as refresh_exc:
+                        print(f"⚠️ dialog refresh failed: {type(refresh_exc).__name__}: {refresh_exc}", flush=True)
+                        dialog = None
+                    if dialog is not None and getattr(dialog, "alive", False):
+                        try:
+                            await self._dialog_turn(
+                                decision,
+                                text,
+                                abort,
+                                send_json,
+                                send_bin,
+                                speak,
+                                on_first_audio,
+                                memory,
+                                dialog,
+                                started,
+                            )
+                            return
+                        except Exception as exc2:
+                            print(f"⚠️ dialog retry failed ({type(exc2).__name__}: {exc2}); cascade", flush=True)
 
         await self._cascade_turn(adapter, text, abort, send_json, send_bin, speak, memory)
         await send_json(protocol.turn_end())
@@ -468,7 +509,10 @@ class VoiceHub:
         dialog: DoubaoRealtimeSession,
         started: float,
     ) -> None:
-        dialog.muted = False
+        if decision.takeover or decision.route == "search":
+            dialog.mute()
+        else:
+            dialog.muted = False
         collected: list[str] = []
 
         async def say_dialog(content: str, *, until: str = "ended", allow_http: bool = True) -> tuple[str, bool]:
@@ -487,7 +531,7 @@ class VoiceHub:
                 on_first_audio,
                 until=until,
                 timeout=20.0,
-                first_audio=3.0,
+                first_audio=5.0,
                 caption=cleaned,
             )
             if got_audio or abort.is_set():
@@ -516,7 +560,6 @@ class VoiceHub:
             return cleaned, True
 
         if decision.takeover:
-            dialog.mute()
             if decision.commands:
                 await send_json(protocol.robot_command(decision.commands))
             spoken, _ = await say_dialog("".join(decision.sentences) or decision.reply)
@@ -526,11 +569,10 @@ class VoiceHub:
             return
 
         if decision.route == "search":
-            dialog.mute()
             loop = asyncio.get_running_loop()
             query = decision.search_q or text
             search_task = loop.run_in_executor(_JOB_POOL, self.pipeline.search_fn, query)
-            filler, _ = await say_dialog("我查一下。", until="ended", allow_http=False)
+            filler, _ = await say_dialog("我查一下。", until="ended", allow_http=True)
             if filler:
                 collected.append(filler)
             notes = await search_task
@@ -540,7 +582,7 @@ class VoiceHub:
                 flush=True,
             )
             city = memory.city if memory is not None else ""
-            answer = spoken_search_reply(notes, city=city)
+            answer = spoken_search_reply(notes, city=city, query=query)
             spoken, _ = await say_dialog(answer, until="ended", allow_http=True)
             if spoken:
                 collected.append(spoken)
@@ -549,8 +591,10 @@ class VoiceHub:
             await send_json(protocol.turn_end())
             return
 
-        if not (getattr(dialog, "_asr_text", "") or "").strip() or str(dialog._asr_text).strip() != text:
-            await dialog.chat_text(text)
+        drain = getattr(dialog, "drain", None)
+        if callable(drain):
+            drain()
+        await dialog.chat_text(text)
         spoken, got_audio = await self._pump_dialog(
             dialog,
             abort,
@@ -563,11 +607,14 @@ class VoiceHub:
         if spoken:
             collected.append(spoken)
         reply = "".join(collected)
-        if reply and not got_audio and not abort.is_set():
-            spoken, _ = await say_dialog(reply, until="ended")
-            if spoken:
-                collected.append(spoken)
-            reply = "".join(collected)
+        if not got_audio and not abort.is_set():
+            if reply:
+                spoken, _ = await say_dialog(reply, until="ended")
+                if spoken:
+                    collected.append(spoken)
+                reply = "".join(collected)
+            else:
+                raise RuntimeError("dialog produced no audio")
         if memory is not None and reply:
             memory.observe_assistant(reply)
         await send_json(protocol.turn_end())
@@ -634,7 +681,7 @@ class VoiceHub:
             if kind == "closed":
                 break
             if kind == "error" and getattr(event, "error", ""):
-                await send_json(protocol.error(event.error))
+                print(f"⚠️ dialog event error: {event.error}", flush=True)
                 break
             if kind == "chat_end":
                 deadline = max(deadline, time.monotonic() + 8.0)
@@ -759,8 +806,8 @@ class VoiceHub:
     ) -> bool:
         if not sentence or abort.is_set():
             return False
-        await send_json(protocol.tts_text(sentence))
-        if abort.is_set() or self.tts is None:
+        if self.tts is None:
+            await send_json(protocol.tts_text(sentence))
             return False
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue()
@@ -797,12 +844,16 @@ class VoiceHub:
                     print(f"⚠️ TTS failed: {type(item).__name__}: {item}", flush=True)
                     break
                 await send_bin(item)
-                if not sent and on_first is not None:
-                    await on_first(sentence)
+                if not sent:
+                    await send_json(protocol.tts_text(sentence))
+                    if on_first is not None:
+                        await on_first(sentence)
                 sent = True
         finally:
             if not abort.is_set():
                 await worker
+        if not sent and not abort.is_set():
+            await send_json(protocol.tts_text(sentence))
         return sent
 
 

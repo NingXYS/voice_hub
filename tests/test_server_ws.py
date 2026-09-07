@@ -211,6 +211,9 @@ class WebsocketServerTests(unittest.TestCase):
                             break
                     self.assertEqual(first, b"\x00\x01")
                     self.assertFalse(tts.second)
+                    caption = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    self.assertFalse(isinstance(caption, bytes))
+                    self.assertEqual(json.loads(caption).get("type"), "tts_text")
                     with self.assertRaises(asyncio.TimeoutError):
                         await asyncio.wait_for(ws.recv(), timeout=0.2)
                     tts.gate.set()

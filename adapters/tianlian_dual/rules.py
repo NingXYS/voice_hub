@@ -21,6 +21,9 @@ def parse_action(text: str):
     raw = raw.replace("左手", "左臂").replace("右手", "右臂")
     if not raw:
         return None
+    massage = _parse_massage(text)
+    if massage is not None:
+        return massage
     if re.fullmatch(r"(左臂|右臂)向?[上下左右前后]", raw) or raw in {"左臂", "右臂", "动一下"}:
         return [{"reply": _CLARIFY}]
     positions = [m.start() for m in re.finditer(r"(左臂|右臂)", raw)]
@@ -73,6 +76,28 @@ def _one(seg: str):
     cmd = {"action": "move_cartesian", "arm": "left" if m.group(1) == "左臂" else "right", "x": 0, "y": 0, "z": 0, "relative": True}
     cmd[axis] = meters * sign
     return cmd
+
+
+_MASSAGE_MOD = None
+
+
+def _parse_massage(text: str):
+    global _MASSAGE_MOD
+    if _MASSAGE_MOD is None:
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).with_name("massage.py")
+        spec = importlib.util.spec_from_file_location("tianlian_dual_massage", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _MASSAGE_MOD = module
+    parser = getattr(_MASSAGE_MOD, "parse_action", None)
+    if not callable(parser):
+        return None
+    return parser(text)
 
 
 def _number(value: str) -> float | None:

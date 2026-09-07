@@ -48,12 +48,12 @@ def web_search(query: str) -> str:
 
 def _metaso_with_retry(query: str, api_key: str) -> dict:
     last_timeout: Exception | None = None
-    for timeout in (5.0, 8.0):
+    for timeout in (8.0, 12.0):
         try:
             return _metaso(query, api_key, timeout=timeout)
         except requests.exceptions.Timeout as exc:
             last_timeout = exc
-            print(f"⚠️ search timeout {timeout:.0f}s, retry" if timeout < 8 else "⚠️ search timeout", flush=True)
+            print(f"⚠️ search timeout {timeout:.0f}s, retry" if timeout < 12 else "⚠️ search timeout", flush=True)
     raise last_timeout or requests.exceptions.Timeout("search timeout")
 
 
@@ -76,6 +76,11 @@ def _metaso(query: str, api_key: str, timeout: float = 8.0) -> dict:
     payload = _json_object(response)
     spoken = _metaso_error(response.status_code, payload)
     if spoken:
+        print(
+            f"⚠️ search http={response.status_code} "
+            f"err={payload.get('errCode') if payload.get('errCode') is not None else payload.get('code')}",
+            flush=True,
+        )
         raise SearchError(spoken)
     return payload
 

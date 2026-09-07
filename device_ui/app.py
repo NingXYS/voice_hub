@@ -19,20 +19,66 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from device_ui import client_settings
 from device_ui.wavutil import pcm_s16le_to_wav
 from jetson_client.session import HubConnectError, HubSession
+from jetson_client.speaker_gate import run_gated_listen
+from jetson_client.wake_kws import KwsCooldown, describe_kws, wake_word as kws_wake_word
+from jetson_client.wake_loop import begin_command_stream, requeue_eof
+
+_WAKE_UNSET = object()
+
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+class _NoStoreStatic(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 STATIC = Path(__file__).resolve().parent / "static"
 
 
 class DeviceState:
-    def __init__(self, session: HubSession | None = None):
+    def __init__(self, session: HubSession | None = None, wake_detector=None):
         self.session = session or HubSession()
+        self.wake_detector = wake_detector
+        self.wake_load_error = ""
+        self._wake_loaded = wake_detector is not None
+        self.voice_ws = 0
+
+    def ensure_wake(self):
+        if self._wake_loaded:
+            return self.wake_detector
+        if os.environ.get("VOICE_KWS_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self._wake_loaded = True
+            self.wake_load_error = "唤醒未启用"
+            return None
+        self._wake_loaded = True
+        try:
+            from jetson_client.wake_kws import KeywordSpotter
+
+            self.wake_detector = KeywordSpotter()
+            print(
+                f"wake kws_ready=true word={kws_wake_word()} model={getattr(self.wake_detector, 'model_path', '')}",
+                flush=True,
+            )
+        except Exception as exc:
+            self.wake_detector = None
+            self.wake_load_error = str(exc)
+            print(f"wake kws_ready=false error={exc}", flush=True)
+        return self.wake_detector
 
 
-def create_app(session: HubSession | None = None) -> Starlette:
-    state = DeviceState(session)
+def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> Starlette:
+    _pin_device_safety()
+    injected = None if wake_detector is _WAKE_UNSET else wake_detector
+    state = DeviceState(session, wake_detector=injected if injected is not _WAKE_UNSET else None)
+    if wake_detector is not _WAKE_UNSET:
+        state._wake_loaded = True
+        if injected is None:
+            state.wake_load_error = "唤醒未启用"
 
     async def homepage(_: Request):
-        return FileResponse(STATIC / "index.html")
+        return FileResponse(STATIC / "index.html", headers=_NO_STORE)
 
     async def api_health(_: Request):
         return JSONResponse({"ok": True, "name": "voice-hub-device"})
@@ -59,6 +105,14 @@ def create_app(session: HubSession | None = None) -> Starlette:
                 "schema_version": session.schema_version or view["schema_version"],
                 "hello": hello,
                 "bridge_error": session.bridge_error if session.connected else "",
+                "bridge_loaded": bool(getattr(session, "bridge_loaded", False)) if session.connected else False,
+                "last_command": getattr(session, "last_command", None) if session.connected else None,
+                "last_bridge_status": getattr(session, "last_bridge_status", "") if session.connected else "",
+                "robot_publish_enabled": _robot_publish_enabled(),
+                "massage_enabled": _massage_enabled(),
+                "speaker_mode": _speaker_mode(),
+                "voice_busy": state.voice_ws > 0,
+                **_wake_view(state),
             }
         )
 
@@ -81,10 +135,18 @@ def create_app(session: HubSession | None = None) -> Starlette:
                 "connected": True,
                 "hello": hello,
                 "bridge_error": state.session.bridge_error,
+                "bridge_loaded": bool(getattr(state.session, "bridge_loaded", False)),
+                "last_command": getattr(state.session, "last_command", None),
+                "last_bridge_status": getattr(state.session, "last_bridge_status", "") or "",
+                "robot_publish_enabled": _robot_publish_enabled(),
+                "massage_enabled": _massage_enabled(),
             }
         )
 
     async def api_disconnect(_: Request):
+        from jetson_client.massage import close_runtime
+
+        close_runtime()
         await state.session.close()
         return JSONResponse({"ok": True, "connected": False})
 
@@ -187,6 +249,7 @@ def create_app(session: HubSession | None = None) -> Starlette:
             await websocket.send_json({"type": "error", "message": "还没有连上主机。请先点连接。"})
             await websocket.close()
             return
+        state.voice_ws += 1
         incoming: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         outgoing: asyncio.Queue[tuple[str, Any] | None] = asyncio.Queue()
 
@@ -229,49 +292,149 @@ def create_app(session: HubSession | None = None) -> Starlette:
                 pass
 
         async def turns() -> None:
-            while True:
-                kind, data = await incoming.get()
-                if kind == "eof":
-                    return
-                if not (kind == "json" and isinstance(data, dict) and data.get("type") == "listen" and data.get("state") == "start"):
-                    if kind == "json" and isinstance(data, dict) and data.get("type") == "abort":
-                        try:
-                            await session.abort_playback()
-                        except Exception:
-                            pass
-                    continue
+            detector = state.ensure_wake()
+            cooldown = KwsCooldown()
+            outgoing.put_nowait(
+                (
+                    "json",
+                    {
+                        "type": "wake",
+                        "status": "waiting" if detector else "error",
+                        "word": kws_wake_word(),
+                        "message": "" if detector else (state.wake_load_error or "唤醒未就绪"),
+                    },
+                )
+            )
 
+            def on_event(ev: dict[str, Any]) -> None:
+                if ev.get("type") == "audio":
+                    return
+                outgoing.put_nowait(("json", ev))
+
+            def on_audio(pcm: bytes) -> None:
+                if pcm:
+                    outgoing.put_nowait(("bin", pcm))
+
+            async def run_listen_from_queue():
                 async def chunks():
                     while True:
                         item_kind, item_data = await incoming.get()
                         if item_kind == "eof":
+                            requeue_eof(incoming, item_kind)
                             return
                         if item_kind == "pcm" and item_data:
                             yield item_data
                         elif (
                             item_kind == "json"
                             and isinstance(item_data, dict)
-                            and item_data.get("type") == "listen"
-                            and item_data.get("state") == "stop"
+                            and item_data.get("type") in {"abort", "listen"}
+                            and (item_data.get("type") == "abort" or item_data.get("state") == "stop")
                         ):
                             return
 
-                def on_event(ev: dict[str, Any]) -> None:
-                    if ev.get("type") == "audio":
-                        return
-                    outgoing.put_nowait(("json", ev))
+                result, decision = await run_gated_listen(
+                    session, chunks(), on_event=on_event, on_audio=on_audio
+                )
+                if result is None:
+                    outgoing.put_nowait(
+                        (
+                            "json",
+                            {
+                                "type": "wake",
+                                "status": "rejected",
+                                "word": kws_wake_word(),
+                                "message": "未通过声纹，请本人再说",
+                                "reason": decision.get("reason"),
+                                "score": decision.get("score"),
+                                "display_name": decision.get("display_name"),
+                                "mode": decision.get("mode"),
+                            },
+                        )
+                    )
 
-                def on_audio(pcm: bytes) -> None:
-                    if pcm:
-                        outgoing.put_nowait(("bin", pcm))
-
+            while True:
+                kind, data = await incoming.get()
+                if kind == "eof":
+                    return
+                if kind == "json" and isinstance(data, dict) and data.get("type") == "abort":
+                    try:
+                        await session.abort_playback()
+                    except Exception:
+                        pass
+                    continue
+                if kind == "json" and isinstance(data, dict) and data.get("type") == "listen" and data.get("state") == "start":
+                    try:
+                        await run_listen_from_queue()
+                    except HubConnectError as exc:
+                        outgoing.put_nowait(("json", {"type": "error", "message": str(exc)}))
+                    except Exception as exc:
+                        print(f"⚠️ device_ui ws turn: {type(exc).__name__}: {exc}", flush=True)
+                        outgoing.put_nowait(("json", {"type": "error", "message": "设备端内部错误，请重试。"}))
+                    continue
+                if kind != "pcm" or not data or detector is None:
+                    continue
+                if not cooldown.allow(len(data)):
+                    continue
+                if not detector.accept_pcm(data):
+                    continue
+                print(f"wake=hit word={kws_wake_word()}", flush=True)
+                outgoing.put_nowait(("json", {"type": "wake", "status": "hit", "word": kws_wake_word()}))
+                did_turn = False
                 try:
-                    await session.listen_stream(chunks(), on_event=on_event, on_audio=on_audio)
+                    stream = await begin_command_stream(incoming)
+                    if stream is None:
+                        print("wake=idle reason=no_speech", flush=True)
+                        outgoing.put_nowait(("json", {"type": "wake", "status": "idle", "reason": "no_speech"}))
+                    else:
+                        streamed = 0
+                        print("wake=stream", flush=True)
+                        outgoing.put_nowait(
+                            ("json", {"type": "wake", "status": "listen", "word": kws_wake_word()})
+                        )
+
+                        async def live_chunks():
+                            nonlocal streamed
+                            async for part in stream:
+                                streamed += len(part)
+                                yield part
+
+                        result, decision = await run_gated_listen(
+                            session, live_chunks(), on_event=on_event, on_audio=on_audio
+                        )
+                        if result is None:
+                            print(
+                                f"wake=rejected bytes={streamed} reason={decision.get('reason')}",
+                                flush=True,
+                            )
+                            outgoing.put_nowait(
+                                (
+                                    "json",
+                                    {
+                                        "type": "wake",
+                                        "status": "rejected",
+                                        "word": kws_wake_word(),
+                                        "message": "未通过声纹，请本人再说",
+                                        "reason": decision.get("reason"),
+                                        "score": decision.get("score"),
+                                        "display_name": decision.get("display_name"),
+                                        "mode": decision.get("mode"),
+                                    },
+                                )
+                            )
+                        else:
+                            did_turn = True
+                            print(f"wake=listen bytes={streamed} streamed=1", flush=True)
                 except HubConnectError as exc:
                     outgoing.put_nowait(("json", {"type": "error", "message": str(exc)}))
                 except Exception as exc:
-                    print(f"⚠️ device_ui ws turn: {type(exc).__name__}: {exc}", flush=True)
+                    print(f"⚠️ device_ui wake turn: {type(exc).__name__}: {exc}", flush=True)
                     outgoing.put_nowait(("json", {"type": "error", "message": "设备端内部错误，请重试。"}))
+                finally:
+                    if detector is not None:
+                        detector.reset()
+                    if did_turn:
+                        cooldown.arm()
+                    outgoing.put_nowait(("json", {"type": "wake", "status": "waiting", "word": kws_wake_word()}))
 
         reader_task = asyncio.create_task(reader())
         writer_task = asyncio.create_task(writer())
@@ -279,6 +442,10 @@ def create_app(session: HubSession | None = None) -> Starlette:
         try:
             await turns_task
         finally:
+            from jetson_client.massage import close_runtime
+
+            close_runtime()
+            state.voice_ws = max(0, state.voice_ws - 1)
             reader_task.cancel()
             outgoing.put_nowait(None)
             for task in (reader_task, writer_task):
@@ -290,6 +457,9 @@ def create_app(session: HubSession | None = None) -> Starlette:
                     pass
 
     async def api_abort(_: Request):
+        from jetson_client.massage import close_runtime
+
+        close_runtime()
         try:
             await state.session.abort_playback()
         except HubConnectError as exc:
@@ -318,9 +488,148 @@ def create_app(session: HubSession | None = None) -> Starlette:
             return JSONResponse({"ok": False, "error": data.get("message") or "记忆操作失败"}, status_code=400)
         return JSONResponse({"ok": True, **{k: data.get(k) for k in ("city", "name", "turns", "path")}})
 
+    async def api_massage_capture(_: Request):
+        from jetson_client.massage import teaching_capture
+
+        result = teaching_capture()
+        code = 200 if result.get("ok") else 400
+        return JSONResponse(result, status_code=code)
+
+    async def api_massage_finish(_: Request):
+        from jetson_client.massage import teaching_finish
+
+        result = teaching_finish()
+        code = 200 if result.get("ok") else 400
+        return JSONResponse(result, status_code=code)
+
+    def _speaker_payload() -> dict[str, Any]:
+        from jetson_client import speaker_gate
+
+        data = speaker_gate.status()
+        data["voice_busy"] = state.voice_ws > 0
+        return data
+
+    def _require_voice_stopped() -> JSONResponse | None:
+        if state.voice_ws > 0:
+            return JSONResponse(
+                {"ok": False, "error": "请先停止语音，再用机器人麦克风登记或试听。"},
+                status_code=409,
+            )
+        return None
+
+    async def api_speakers(request: Request):
+        from jetson_client import speaker_gate
+
+        if request.method == "GET":
+            return JSONResponse(_speaker_payload())
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        mode = str((body or {}).get("mode") or "").strip().lower()
+        try:
+            client_settings.set_speaker_mode(mode)
+        except client_settings.SettingsError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        speaker_gate.reset_verifier()
+        payload = _speaker_payload()
+        payload["ok"] = True
+        return JSONResponse(payload)
+
+    async def api_speaker_enroll_start(request: Request):
+        from jetson_client import speaker_gate
+
+        blocked = _require_voice_stopped()
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str((body or {}).get("display_name") or (body or {}).get("name") or "").strip()
+        try:
+            enrollment = speaker_gate.start_enrollment(name)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, **enrollment})
+
+    async def api_speaker_enroll_sample(request: Request):
+        from jetson_client import speaker_gate
+
+        blocked = _require_voice_stopped()
+        if blocked is not None:
+            return blocked
+        session_id = request.path_params.get("session_id") or ""
+        try:
+            pcm, _audio_ms = await asyncio.to_thread(speaker_gate.capture_locked)
+            result = speaker_gate.add_enrollment_pcm(session_id, pcm)
+        except KeyError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, **result})
+
+    async def api_speaker_enroll_commit(request: Request):
+        from jetson_client import speaker_gate
+
+        blocked = _require_voice_stopped()
+        if blocked is not None:
+            return blocked
+        session_id = request.path_params.get("session_id") or ""
+        try:
+            result = speaker_gate.commit_enrollment(session_id)
+        except KeyError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse(result)
+
+    async def api_speaker_enroll_cancel(request: Request):
+        from jetson_client import speaker_gate
+
+        session_id = request.path_params.get("session_id") or ""
+        try:
+            speaker_gate.cancel_enrollment(session_id)
+        except KeyError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        return JSONResponse({"ok": True, "enrollment": None})
+
+    async def api_speaker_delete(request: Request):
+        from jetson_client import speaker_gate
+
+        blocked = _require_voice_stopped()
+        if blocked is not None:
+            return blocked
+        speaker_id = request.path_params.get("speaker_id") or ""
+        try:
+            ok = speaker_gate.delete_profile(speaker_id)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        if not ok:
+            return JSONResponse({"ok": False, "error": "没有这个声纹档案。"}, status_code=404)
+        return JSONResponse({"ok": True, "speaker_id": speaker_id})
+
+    async def api_speaker_probe(_: Request):
+        from jetson_client import speaker_gate
+
+        blocked = _require_voice_stopped()
+        if blocked is not None:
+            return blocked
+        try:
+            pcm, audio_ms = await asyncio.to_thread(speaker_gate.capture_locked)
+            decision = speaker_gate.score_pcm(pcm)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        decision["ok"] = True
+        decision["audio_ms"] = audio_ms
+        return JSONResponse(decision)
+
     @asynccontextmanager
     async def lifespan(_: Starlette):
         yield
+        from jetson_client.massage import close_runtime
+
+        close_runtime()
         await state.session.close()
 
     app = Starlette(
@@ -335,8 +644,29 @@ def create_app(session: HubSession | None = None) -> Starlette:
             Route("/api/say/stream", api_say_stream, methods=["POST"]),
             Route("/api/abort", api_abort, methods=["POST"]),
             Route("/api/memory", api_memory, methods=["GET", "PUT", "DELETE"]),
+            Route("/api/massage/teaching/capture", api_massage_capture, methods=["POST"]),
+            Route("/api/massage/teaching/finish", api_massage_finish, methods=["POST"]),
+            Route("/api/speakers", api_speakers, methods=["GET", "PUT"]),
+            Route("/api/speakers/enrollments", api_speaker_enroll_start, methods=["POST"]),
+            Route(
+                "/api/speakers/enrollments/{session_id}/samples",
+                api_speaker_enroll_sample,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/speakers/enrollments/{session_id}/commit",
+                api_speaker_enroll_commit,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/speakers/enrollments/{session_id}",
+                api_speaker_enroll_cancel,
+                methods=["DELETE"],
+            ),
+            Route("/api/speakers/probes", api_speaker_probe, methods=["POST"]),
+            Route("/api/speakers/{speaker_id}", api_speaker_delete, methods=["DELETE"]),
             WebSocketRoute("/ws/voice", ws_voice),
-            Mount("/static", StaticFiles(directory=str(STATIC)), name="static"),
+            Mount("/static", _NoStoreStatic(directory=str(STATIC)), name="static"),
         ],
         lifespan=lifespan,
     )
@@ -356,6 +686,8 @@ def main() -> None:
     import webbrowser
 
     import uvicorn
+
+    _pin_device_safety()
 
     host = os.environ.get("DEVICE_UI_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
@@ -378,6 +710,43 @@ def main() -> None:
     if os.environ.get("DEVICE_UI_OPEN_BROWSER", "1").strip().lower() not in {"0", "false", "no"}:
         webbrowser.open(url)
     uvicorn.run(create_app(), host=host, port=port, log_level="info")
+
+
+def _wake_view(state: DeviceState) -> dict[str, Any]:
+    info = describe_kws()
+    if state._wake_loaded:
+        info["kws_ready"] = bool(state.wake_detector)
+        if state.wake_load_error:
+            info["kws_error"] = state.wake_load_error
+    return {
+        "wake_word": info.get("wake_word") or kws_wake_word(),
+        "kws_model": info.get("kws_model") or "",
+        "kws_ready": bool(info.get("kws_ready")),
+        "kws_error": str(info.get("kws_error") or ""),
+    }
+
+
+def _pin_device_safety() -> None:
+    """Cloud keys stay off. Live/demo switches come from client.env, default 0."""
+    client_settings.apply_device_flags()
+
+
+def _flag_on(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _robot_publish_enabled() -> bool:
+    return _flag_on("VOICE_ENABLE_ROBOT_COMMAND")
+
+
+def _massage_enabled() -> bool:
+    return _flag_on("VOICE_ENABLE_MASSAGE")
+
+
+def _speaker_mode() -> str:
+    from jetson_client.speaker_gate import verify_mode
+
+    return verify_mode()
 
 
 def _port_open(host: str, port: int) -> bool:

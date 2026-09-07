@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from server import config
 from server.adapter_loader import Adapter
 from server.memory import ConversationMemory, city_in_text, extract_city
 from server.providers.llm_openai import OpenAICompatLLM, split_sentences, split_speakable
@@ -22,10 +23,12 @@ SEARCH_HINTS = (
 )
 WEATHER_HINTS = ("天气", "气温", "下雨", "下雪", "温度", "穿什么", "出门")
 STALL_PHRASES = ("正在搜索", "正在查询", "我去搜", "稍等一下", "请稍候", "正在为您查询")
-CONTROL_HINTS = ("臂", "关节", "厘米", "毫米", "回零", "归零", "夹爪", "夹子")
+CONTROL_HINTS = ("臂", "关节", "厘米", "毫米", "回零", "归零", "夹爪", "夹子", "按摩", "示教", "点位", "左肩", "右肩")
 UNCLEAR = "刚才没有听清，请再说一次。"
 ASK_CITY = "你在哪个城市？说一次我记住，下次问天气就不用再说了。"
 LLM_DOWN = "聊天服务还没配置。请在电脑上设置 CHAT_LLM_API_KEY 和 CHAT_LLM_MODEL（百炼 Qwen，例如 qwen-flash）。"
+CHAT_RETRY = "刚才聊天没接上，请再说一次。"
+_LLM_SETUP_MARKS = ("CHAT_LLM_API_KEY", "聊天密钥无效", "百炼控制台", "还没有填写模型名", "聊天服务还没配置")
 
 
 @dataclass
@@ -75,10 +78,54 @@ def date_label(when: datetime) -> str:
 
 
 _FACT_MARKS = (
-    "天气", "气温", "温度", "℃", "°C", "阴", "晴", "雨", "雪", "多云", "雾", "风",
-    "度", "高温", "低温", "穿",
+    "天气", "气温", "温度", "℃", "°C", "阴", "晴", "雨", "雪", "多云", "雾",
+    "高温", "低温",
 )
-_JUNK_MARKS = ("景点", "美食", "特产", "排行榜", "点击查看", "页面还提供", "旅游攻略", "十大")
+_WEATHER_MARKS = ("气温", "℃", "°C", "阴", "晴", "雨", "雪", "多云", "雾", "高温", "低温", "天气")
+_JUNK_MARKS = (
+    "景点", "美食", "特产", "排行榜", "点击查看", "页面还提供", "旅游攻略", "十大",
+    "喜神", "福神", "财神", "阳贵", "阴贵", "黄历", "宜：", "忌：", "宜疗", "忌安葬",
+    "安葬", "动土", "针灸", "入仓", "求职", "疗病", "结婚", "当日为星期",
+    "紫外线", "空气质量", "建议穿", "单层", "套装", "T恤", "湿度",
+)
+_DATE_FULL = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+_DATE_MD = re.compile(r"(\d{1,2})月(\d{1,2})日")
+_HOLIDAY_ASK = ("多少天", "几天", "几号", "哪天", "什么时候", "何时", "放假")
+_HOLIDAY_LABEL = {
+    "元旦": "元旦",
+    "除夕": "除夕",
+    "春节": "春节",
+    "元宵": "元宵节",
+    "清明": "清明节",
+    "端午": "端午节",
+    "中秋": "中秋节",
+    "国庆": "国庆节",
+    "圣诞": "圣诞节",
+}
+# Public-facing solar dates. Prefer this over web snippets for countdowns.
+_HOLIDAYS = {
+    2025: {
+        "元旦": (1, 1), "除夕": (1, 28), "春节": (1, 29), "元宵": (2, 12),
+        "清明": (4, 4), "端午": (5, 31), "中秋": (10, 6), "国庆": (10, 1), "圣诞": (12, 25),
+    },
+    2026: {
+        "元旦": (1, 1), "除夕": (2, 16), "春节": (2, 17), "元宵": (3, 3),
+        "清明": (4, 5), "端午": (6, 19), "中秋": (9, 25), "国庆": (10, 1), "圣诞": (12, 25),
+    },
+    2027: {
+        "元旦": (1, 1), "除夕": (2, 5), "春节": (2, 6), "元宵": (2, 20),
+        "清明": (4, 5), "端午": (6, 9), "中秋": (9, 15), "国庆": (10, 1), "圣诞": (12, 25),
+    },
+}
+
+
+def looks_like_llm_setup(text: str) -> bool:
+    blob = text or ""
+    return any(mark in blob for mark in _LLM_SETUP_MARKS)
+
+
+def _chat_fallback_reply() -> str:
+    return CHAT_RETRY if config.dialog_configured() else LLM_DOWN
 
 
 def _search_line_body(line: str) -> str:
@@ -90,7 +137,41 @@ def _search_line_body(line: str) -> str:
     return text
 
 
-def spoken_search_reply(notes: str, *, city: str = "") -> str:
+def _allowed_dates(query: str, now: datetime | None = None) -> set[tuple[int, int]]:
+    now = now or datetime.now()
+    allowed: set[tuple[int, int]] = set()
+    blob = query or ""
+    for match in _DATE_FULL.finditer(blob):
+        allowed.add((int(match.group(2)), int(match.group(3))))
+    if "明天" in blob:
+        nxt = now + timedelta(days=1)
+        allowed.add((nxt.month, nxt.day))
+    if "今天" in blob or looks_like_weather(blob):
+        allowed.add((now.month, now.day))
+    return allowed
+
+
+def _sentence_date_ok(sentence: str, allowed: set[tuple[int, int]]) -> bool:
+    if not allowed:
+        return True
+    found: list[tuple[int, int]] = []
+    for match in _DATE_FULL.finditer(sentence):
+        found.append((int(match.group(2)), int(match.group(3))))
+    if not found:
+        for match in _DATE_MD.finditer(sentence):
+            found.append((int(match.group(1)), int(match.group(2))))
+    if not found:
+        return True
+    return any(item in allowed for item in found)
+
+
+def spoken_search_reply(
+    notes: str,
+    *,
+    city: str = "",
+    query: str = "",
+    now: datetime | None = None,
+) -> str:
     text = (notes or "").strip()
     if not text:
         return "网上没有查到有用的信息。"
@@ -100,23 +181,71 @@ def spoken_search_reply(notes: str, *, city: str = "") -> str:
         return head[:80]
     bodies = [_search_line_body(line) for line in lines]
     bodies = [body for body in bodies if body]
-    facts = [body for body in bodies if any(mark in body for mark in _FACT_MARKS)]
+    weather_query = looks_like_weather(query) or any(mark in "".join(bodies) for mark in _WEATHER_MARKS)
+    marks = _WEATHER_MARKS if weather_query else _FACT_MARKS
+    facts = [body for body in bodies if any(mark in body for mark in marks)]
     blob = "".join(facts or bodies)
     sentences = [part.strip() for part in re.split(r"(?<=[。！？!?])", blob) if part.strip()]
+    allowed = _allowed_dates(query, now=now)
     chosen: list[str] = []
     for sentence in sentences:
         if any(mark in sentence for mark in _JUNK_MARKS):
             continue
+        if not _sentence_date_ok(sentence, allowed):
+            continue
+        if weather_query and not any(mark in sentence for mark in _WEATHER_MARKS):
+            continue
         chosen.append(sentence)
-        if len("".join(chosen)) >= 180 or len(chosen) >= 3:
+        limit = 90 if weather_query else 160
+        if len("".join(chosen)) >= limit or len(chosen) >= (2 if weather_query else 3):
             break
-    piece = "".join(chosen).strip() or blob
-    piece = piece[:220]
-    if city and city not in piece:
+    piece = "".join(chosen).strip()
+    if not piece:
+        if weather_query:
+            return "网上没有查到这次要的天气，请稍后再问。"
+        return "网上没有查到有用的信息。"
+    piece = piece[:90] if weather_query else piece[:160]
+    if city and city not in piece and any(mark in piece for mark in marks):
         piece = f"{city}，{piece}"
     if piece[-1:] not in "。！？!?":
         piece += "。"
     return piece
+
+
+def holiday_countdown_reply(text: str, now: datetime | None = None) -> str | None:
+    now = now or datetime.now()
+    needle = _norm(text)
+    if not any(mark in needle for mark in _HOLIDAY_ASK):
+        return None
+    if "放假" in needle and any(mark in needle for mark in ("安排", "调休", "放几天")):
+        return None
+    hit = next((name for name in _HOLIDAY_LABEL if name in needle), "")
+    if not hit:
+        return None
+    year = now.year
+    names = _HOLIDAYS.get(year) or {}
+    if hit not in names:
+        year += 1
+        names = _HOLIDAYS.get(year) or {}
+    if hit not in names:
+        return None
+    month, day = names[hit]
+    target = datetime(year, month, day)
+    if target.date() < now.date():
+        names = _HOLIDAYS.get(year + 1) or {}
+        if hit not in names:
+            return None
+        month, day = names[hit]
+        target = datetime(year + 1, month, day)
+    days = (target.date() - now.date()).days
+    label = _HOLIDAY_LABEL[hit]
+    today = f"{now.month}月{now.day}日"
+    when = f"{target.month}月{target.day}日"
+    if days <= 0:
+        return f"今天是{today}，就是{label}。"
+    if days == 1:
+        return f"今天是{today}，{label}是明天{when}。"
+    return f"今天是{today}，{label}是{when}，还有{days}天。"
 
 
 def search_query(text: str, now: datetime | None = None, city: str = "") -> str:
@@ -134,7 +263,7 @@ def search_query(text: str, now: datetime | None = None, city: str = "") -> str:
             parts.append(stamp)
     elif str(now.year) not in cleaned:
         parts.append(f"{now.year}年")
-    if city and city not in cleaned:
+    if city and city not in cleaned and any(mark in needle for mark in WEATHER_HINTS):
         parts.append(city)
     parts.append(cleaned)
     return " ".join(part for part in parts if part).strip()
@@ -185,14 +314,28 @@ class Pipeline:
                     )
                 commands = [item for item in parsed if "reply" not in item]
                 if commands:
-                    ack = adapter.ack_text
+                    ack = str(commands[0].get("say") or adapter.ack_text)
+                    cleaned_commands = [
+                        {key: value for key, value in item.items() if key != "say"} for item in commands
+                    ]
                     return TurnResult(
                         route="local_action",
                         reply=ack,
-                        commands=commands,
-                        sentences=[ack],
+                        commands=cleaned_commands,
+                        sentences=split_speakable(ack) if "massage" in {
+                            str(item.get("action") or "") for item in cleaned_commands
+                        } else [ack],
                         takeover=True,
                     )
+
+        calendar = holiday_countdown_reply(cleaned)
+        if calendar:
+            return TurnResult(
+                route="calendar",
+                reply=calendar,
+                sentences=split_speakable(calendar),
+                takeover=True,
+            )
 
         city = (memory.city if memory is not None else "") or city_in_text(cleaned)
         want_search = looks_like_search(cleaned) and not looks_like_control(cleaned)
@@ -245,6 +388,8 @@ class Pipeline:
                 return
             if any(p in sentence for p in STALL_PHRASES):
                 return
+            if looks_like_llm_setup(sentence) and config.dialog_configured():
+                return
             on_sentence(sentence)
 
         if decision.route == "search":
@@ -256,7 +401,7 @@ class Pipeline:
             notes = self.search_fn(query)
             print(f"search_q={query!r} search_ms={int((_time.monotonic() - t0) * 1000)}", flush=True)
             city = memory.city if memory is not None else ""
-            answer = spoken_search_reply(notes, city=city)
+            answer = spoken_search_reply(notes, city=city, query=query)
             emit(answer)
             if memory is not None:
                 memory.observe_assistant(answer)
@@ -264,7 +409,7 @@ class Pipeline:
             return TurnResult(route="search", reply=answer, sentences=sentences, search_q=query)
 
         if not self.llm.configured:
-            result = self._reply("chat", LLM_DOWN, on_sentence)
+            result = self._reply("chat", _chat_fallback_reply(), on_sentence)
             if memory is not None:
                 memory.observe_assistant(result.reply)
             return result
@@ -278,6 +423,10 @@ class Pipeline:
             search_fn=self.search_fn if enable_search else None,
             history=history,
         )
+        if looks_like_llm_setup(text_out) and config.dialog_configured():
+            text_out = CHAT_RETRY
+            if on_sentence:
+                on_sentence(text_out)
         sentences = split_sentences(text_out) or ([text_out] if text_out else [])
         if memory is not None:
             memory.observe_assistant(text_out)

@@ -516,6 +516,19 @@ class DoubaoRealtimeSession:
             encode_event(EVENT_CHAT_RAG_TEXT, {"external_rag": payload}, session_id=self.session_id)
         )
 
+    def _accept_dialog_output(self, event: RealtimeEvent) -> bool:
+        """Drop auto-reply while ChatTTSText is pending, and all audio/text while muted."""
+        if event.kind not in {"audio", "text"}:
+            return True
+        if self._hold_default_audio:
+            if event.tts_type in CHAT_TTS_TYPES:
+                self._hold_default_audio = False
+            else:
+                return False
+        if self.muted:
+            return False
+        return True
+
     def mute(self) -> None:
         self.muted = True
         self.drain()
@@ -604,14 +617,7 @@ class DoubaoRealtimeSession:
                     self._asr_done.set()
                     self._ready.set()
                     self._session_ready.set()
-                if event.kind == "text" and event.tts_type in CHAT_TTS_TYPES:
-                    self._hold_default_audio = False
-                if self._hold_default_audio and event.kind in {"audio", "text"}:
-                    if event.tts_type and event.tts_type not in CHAT_TTS_TYPES:
-                        continue
-                    if event.kind == "audio":
-                        self._hold_default_audio = False
-                if self.muted and event.kind in {"audio", "text"}:
+                if not self._accept_dialog_output(event):
                     continue
                 if event.kind == "audio" and event.pcm:
                     rate = config.dialog_output_rate()

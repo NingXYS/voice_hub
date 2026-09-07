@@ -49,6 +49,8 @@ class HubSession:
         self.schema_version = 1
         self.hello: dict[str, Any] | None = None
         self.bridge_error = ""
+        self.last_command: list[dict[str, Any]] | None = None
+        self.last_bridge_status = ""
         self._ws: Any = None
         self._bridge: Any = None
         self._lock = asyncio.Lock()
@@ -58,6 +60,10 @@ class HubSession:
     @property
     def connected(self) -> bool:
         return self._open and self._ws is not None
+
+    @property
+    def bridge_loaded(self) -> bool:
+        return self._bridge is not None
 
     async def connect(self, url: str, robot_id: str, schema_version: int) -> dict[str, Any]:
         url = (url or "").strip()
@@ -263,11 +269,16 @@ class HubSession:
             if on_event:
                 on_event(payload)
             kind = payload.get("type")
-            if kind == "robot_command" and self._bridge is not None:
-                status = self._bridge.execute_commands(payload.get("commands") or [])
+            if kind == "robot_command":
+                commands = payload.get("commands") or []
+                self.last_command = commands if isinstance(commands, list) else []
+                status = await self._run_bridge(self.last_command)
+                self.last_bridge_status = status
                 bridge_event = {"type": "bridge", "status": status}
                 result.events.append(bridge_event)
                 self._emit(bridge_event)
+                if on_event:
+                    on_event(bridge_event)
             if kind in {"error", "hello_reject", "turn_end"}:
                 break
             if kind == "tts_text":
@@ -341,12 +352,43 @@ class HubSession:
         self.hello = None
         self._bridge = None
         self.bridge_error = ""
+        self.last_command = None
+        self.last_bridge_status = ""
         if ws is None:
             return
         try:
             await ws.close()
         except Exception:
             pass
+
+    async def _run_bridge(self, commands: list[dict[str, Any]]) -> str:
+        items = commands if isinstance(commands, list) else []
+        massage = [item for item in items if isinstance(item, dict) and item.get("action") == "massage"]
+        rest = [item for item in items if not (isinstance(item, dict) and item.get("action") == "massage")]
+        if massage and rest:
+            return "rejected"
+        if massage:
+            from jetson_client.massage import execute_commands as execute_massage
+
+            def _massage() -> str:
+                return str(execute_massage(massage) or "")
+
+            try:
+                return await asyncio.to_thread(_massage)
+            except Exception as exc:
+                print(f"⚠️ massage execute: {type(exc).__name__}: {exc}", flush=True)
+                return "error"
+        if self._bridge is None:
+            return "no_bridge"
+
+        def _execute() -> str:
+            return str(self._bridge.execute_commands(rest if rest else items) or "")
+
+        try:
+            return await asyncio.to_thread(_execute)
+        except Exception as exc:
+            print(f"⚠️ bridge execute: {type(exc).__name__}: {exc}", flush=True)
+            return "error"
 
     def _emit(self, payload: dict[str, Any]) -> None:
         if self.on_event:

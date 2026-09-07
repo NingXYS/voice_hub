@@ -1,6 +1,6 @@
 id: tianlian_dual
 name: 施耐力双臂
-wake_word: 小西小西
+wake_word: 小溪小溪
 schema_version: 1
 capabilities:
   arms: [left, right]

@@ -13,11 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-BRIDGE_ROOT = Path("/home/ning/model/lyz/src/tianlian_voice_bridge")
-if BRIDGE_ROOT.is_dir() and str(BRIDGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(BRIDGE_ROOT))
 
+from jetson_client.plugin import ensure_bridge_on_path  # noqa: E402
 from jetson_client.session import HubConnectError, HubSession  # noqa: E402
+
+ensure_bridge_on_path()
 
 
 def _read_pcm(path: str) -> bytes:
@@ -308,7 +308,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--loop", action="store_true", help="with --mic, keep talking after each reply")
     parser.add_argument("--seconds", type=float, default=0, help="with --mic, record this many seconds instead of waiting for Enter")
     parser.add_argument("--play", action="store_true")
+    parser.add_argument("--wake", action="store_true", help="wait for 小溪小溪, then one host turn, repeat")
     args = parser.parse_args(argv)
+    if args.wake:
+        from jetson_client.wake_loop import run_wake
+
+        try:
+            return asyncio.run(
+                run_wake(args.url, args.robot_id, args.schema_version, args.play, on_event=_print_event)
+            )
+        except KeyboardInterrupt:
+            print("interrupted", flush=True)
+            return 130
     if not args.text and not args.pcm:
         args.mic = True
     try:
