@@ -75,7 +75,21 @@ class HubSession:
         async with self._lock:
             return await self._connect_locked(url, robot_id, schema_version)
 
+    def _same_target(self, url: str, robot_id: str, schema_version: int) -> bool:
+        return (
+            self.url == url
+            and self.robot_id == robot_id
+            and int(self.schema_version or 0) == int(schema_version)
+        )
+
     async def _connect_locked(self, url: str, robot_id: str, schema_version: int) -> dict[str, Any]:
+        if (
+            self.connected
+            and self._same_target(url, robot_id, schema_version)
+            and isinstance(self.hello, dict)
+            and self.hello.get("type") == "hello_ok"
+        ):
+            return self.hello
         await self._close_unlocked()
         try:
             ws = await websockets.connect(
@@ -170,6 +184,7 @@ class HubSession:
         idle_after_speech: float = 8.0,
         on_audio: OnAudio | None = None,
         on_event: OnEvent | None = None,
+        on_utterance_end: Callable[[], None] | None = None,
     ) -> SayResult:
         if not pcm:
             raise HubConnectError("没有收到录音。")
@@ -185,6 +200,7 @@ class HubSession:
             idle_after_speech=idle_after_speech,
             on_audio=on_audio,
             on_event=on_event,
+            on_utterance_end=on_utterance_end,
         )
 
     async def listen_stream(
@@ -194,6 +210,7 @@ class HubSession:
         idle_after_speech: float = 20.0,
         on_audio: OnAudio | None = None,
         on_event: OnEvent | None = None,
+        on_utterance_end: Callable[[], None] | None = None,
     ) -> SayResult:
         async with self._lock:
             if not self.connected:
@@ -211,6 +228,11 @@ class HubSession:
                         await ws.send(json.dumps({"type": "listen", "state": "stop"}))
                     except Exception:
                         pass
+                    if on_utterance_end is not None:
+                        try:
+                            on_utterance_end()
+                        except Exception:
+                            pass
 
             pump_task = asyncio.create_task(pump())
             try:
@@ -322,11 +344,14 @@ class HubSession:
                     return data
 
     async def abort_playback(self) -> None:
-        """Stop the host's current TTS. Safe to call while say() is receiving."""
+        """Stop the host's current TTS. No-op if the host socket is already down."""
         ws = self._ws
         if not self._open or ws is None:
-            raise HubConnectError("还没有连上主机。请先点连接。")
-        await ws.send(json.dumps({"type": "abort"}, ensure_ascii=False))
+            return
+        try:
+            await ws.send(json.dumps({"type": "abort"}, ensure_ascii=False))
+        except Exception:
+            pass
 
     async def close(self) -> None:
         async with self._lock:

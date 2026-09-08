@@ -283,13 +283,13 @@ class SpeakerWsEnforceTests(unittest.TestCase):
             stream_calls = 0
             pcm_calls = 0
 
-            async def listen_stream(self, chunks, idle_after_speech=8.0, on_audio=None, on_event=None):
+            async def listen_stream(self, chunks, idle_after_speech=8.0, on_audio=None, on_event=None, **kwargs):
                 self.stream_calls += 1
                 async for _pcm in chunks:
                     pass
                 return SayResult(events=[{"type": "turn_end"}], pcm=b"")
 
-            async def listen_pcm(self, pcm, idle_after_speech=8.0, on_audio=None, on_event=None):
+            async def listen_pcm(self, pcm, idle_after_speech=8.0, on_audio=None, on_event=None, **kwargs):
                 self.pcm_calls += 1
                 return SayResult(events=[{"type": "turn_end"}], pcm=b"")
 

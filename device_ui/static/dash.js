@@ -15,6 +15,40 @@ let msgChain = Promise.resolve();
 let voiced = false;
 let silenceMs = 0;
 let voicedMs = 0;
+let dingAudio = null;
+
+function wakeDingPcm() {
+  const rate = 16000;
+  const frames = Math.floor(0.12 * rate);
+  const out = new Int16Array(frames);
+  for (let i = 0; i < frames; i += 1) {
+    const envelope = Math.min(1.0, i / Math.max(1, frames * 0.1), (frames - i) / Math.max(1, frames * 0.1));
+    out[i] = Math.round(8000 * envelope * Math.sin(2 * Math.PI * 880 * i / rate));
+  }
+  return new Uint8Array(out.buffer);
+}
+
+function playWakeDing() {
+  const bytes = wakeDingPcm();
+  if (player && player.playChunk) {
+    player.playChunk(bytes).catch(() => playWakeDingFile());
+    return;
+  }
+  playWakeDingFile();
+}
+
+function playWakeDingFile() {
+  try {
+    if (!dingAudio) {
+      dingAudio = new Audio("/static/wake_ding.wav?v=ding-1");
+      dingAudio.preload = "auto";
+    }
+    dingAudio.pause();
+    dingAudio.currentTime = 0;
+    const play = dingAudio.play();
+    if (play && play.catch) play.catch(() => {});
+  } catch (err) { /* ignore */ }
+}
 
 async function api(path, options = {}) {
   try {
@@ -106,7 +140,13 @@ function downsample(input, fromRate, toRate) {
   const ratio = fromRate / toRate;
   const n = Math.floor(input.length / ratio);
   const out = new Float32Array(n);
-  for (let i = 0; i < n; i += 1) out[i] = input[Math.min(input.length - 1, Math.floor(i * ratio))];
+  for (let i = 0; i < n; i += 1) {
+    const src = i * ratio;
+    const i0 = Math.floor(src);
+    const i1 = Math.min(input.length - 1, i0 + 1);
+    const frac = src - i0;
+    out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+  }
   return out;
 }
 
@@ -127,12 +167,23 @@ function rms(f32) {
 
 async function startCapture(onFrame) {
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    audio: {
+      channelCount: 1,
+      sampleRate: { ideal: 16000 },
+      echoCancellation: true,
+      noiseSuppression: false,
+      autoGainControl: true,
+    },
   });
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let ctx;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  } catch (err) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+  }
   if (ctx.state === "suspended") await ctx.resume();
   const source = ctx.createMediaStreamSource(stream);
-  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const proc = ctx.createScriptProcessor(2048, 1, 1);
   proc.onaudioprocess = (ev) => {
     const input = ev.inputBuffer.getChannelData(0);
     const resampled = downsample(input, ctx.sampleRate, 16000);
@@ -218,7 +269,11 @@ function createPcmPlayer(sampleRate) {
   };
 }
 
-async function saveAndConnect() {
+async function saveAndConnect(opts = {}) {
+  if (running && !opts.allowWhileStarting) {
+    setMsg("语音正在进行，请先停止再更换主机。", false);
+    return connected;
+  }
   await api("/api/settings", {
     method: "PUT",
     body: JSON.stringify({
@@ -257,6 +312,8 @@ function handleEvent(ev) {
     return;
   }
   if (ev.type === "wake" && ev.status === "hit") {
+    if (player) player.stop();
+    playWakeDing();
     wakeArmed = true;
     recording = true;
     voiced = false;
@@ -324,15 +381,39 @@ function handleEvent(ev) {
 
 async function startVoice() {
   if (running) return;
-  const ok = await saveAndConnect();
-  if (!ok) return;
-  player = createPcmPlayer(16000);
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  voiceWs = new WebSocket(proto + "://" + location.host + "/ws/voice");
-  await new Promise((resolve, reject) => {
-    voiceWs.onopen = resolve;
-    voiceWs.onerror = () => reject(new Error("ws"));
-  });
+  running = true;
+  $("startBtn").disabled = true;
+  $("stopBtn").disabled = false;
+  if ($("saveBtn")) $("saveBtn").disabled = true;
+  if ($("logs")) $("logs").innerHTML = "";
+  try {
+    const status = await api("/api/status");
+    if (status.connected) {
+      setRuntime(true, "已连接");
+    } else {
+      const ok = await saveAndConnect({ allowWhileStarting: true });
+      if (!ok) throw new Error("connect");
+    }
+    player = createPcmPlayer(16000);
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    voiceWs = new WebSocket(proto + "://" + location.host + "/ws/voice");
+    await new Promise((resolve, reject) => {
+      voiceWs.onopen = resolve;
+      voiceWs.onerror = () => reject(new Error("ws"));
+    });
+  } catch (err) {
+    running = false;
+    $("startBtn").disabled = false;
+    $("stopBtn").disabled = true;
+    if ($("saveBtn")) $("saveBtn").disabled = false;
+    if (voiceWs) {
+      try { voiceWs.close(); } catch (closeErr) { /* ignore */ }
+      voiceWs = null;
+    }
+    if (err && err.message === "connect") return;
+    setMsg("语音通道没打开，请确认已连接主机后重试。", false);
+    return;
+  }
   async function onVoiceMessage(ev) {
     if (typeof ev.data !== "string") {
       const buf = ev.data instanceof Blob ? await ev.data.arrayBuffer() : ev.data;
@@ -343,12 +424,13 @@ async function startVoice() {
     const evj = JSON.parse(ev.data);
     handleEvent(evj);
     if (evj.type === "turn_end") {
+      if (talkPhase === "recording") return;
       const wait = player && player.playbackDone ? player.playbackDone() : Promise.resolve();
       await wait;
       await new Promise((resolve) => setTimeout(resolve, 400));
       wakeArmed = false;
       recording = false;
-      if (running) {
+      if (running && talkPhase !== "recording") {
         setPhase("waiting", "等待唤醒", "可以说下一次「小溪小溪」");
         $("assistantStage").textContent = "小溪 · 等待";
       }
@@ -358,9 +440,26 @@ async function startVoice() {
     msgChain = msgChain.then(() => onVoiceMessage(ev)).catch((err) => console.warn("voice message", err));
   };
   try {
+    let lastMicHint = 0;
     capture = await startCapture((bytes, energy) => {
-      if (!running || talkPhase === "speaking") return;
+      if (!running) return;
       if (voiceWs && voiceWs.readyState === 1) voiceWs.send(bytes);
+      if (talkPhase === "waiting" || talkPhase === "recording") {
+        const now = performance.now();
+        if (now - lastMicHint > 450) {
+          lastMicHint = now;
+          if (energy < 0.004) {
+            $("phaseHint").textContent = talkPhase === "recording"
+              ? "麦克风很轻，请靠近再说"
+              : "麦克风很轻，请靠近说「小溪小溪」";
+          } else if (energy >= 0.010) {
+            $("phaseHint").textContent = talkPhase === "recording"
+              ? "正在听，说完稍停"
+              : "听到声音了，请说「小溪小溪」";
+          }
+        }
+      }
+      if (talkPhase === "speaking" || talkPhase === "processing") return;
       if (!wakeArmed) return;
       const dt = 1000 * (bytes.length / 2) / 16000;
       if (energy >= 0.012) {
@@ -370,7 +469,7 @@ async function startVoice() {
       } else if (voiced) {
         silenceMs += dt;
       }
-      if (recording && voiced && voicedMs >= 200 && silenceMs >= 800) {
+      if (recording && voiced && voicedMs >= 200 && silenceMs >= 550) {
         recording = false;
         if (voiceWs && voiceWs.readyState === 1) {
           voiceWs.send(JSON.stringify({ type: "listen", state: "stop" }));
@@ -379,16 +478,32 @@ async function startVoice() {
       }
     });
   } catch (err) {
+    running = false;
+    $("startBtn").disabled = false;
+    $("stopBtn").disabled = true;
+    if ($("saveBtn")) $("saveBtn").disabled = false;
     setMsg("浏览器不允许使用麦克风，请在权限里允许。", false);
-    voiceWs.close();
+    if (voiceWs) {
+      try { voiceWs.close(); } catch (closeErr) { /* ignore */ }
+      voiceWs = null;
+    }
     return;
   }
-  running = true;
-  $("startBtn").disabled = true;
-  $("stopBtn").disabled = false;
   setPhase("waiting", "等待唤醒", "请说「小溪小溪」");
+  setMsg("已启动，请说「小溪小溪」。", true);
   voiceWs.onclose = () => {
-    if (running) setMsg("语音通道断开。", false);
+    if (!running) return;
+    setMsg("语音通道断开，正在重连…", false);
+    window.setTimeout(() => {
+      if (!running) return;
+      running = false;
+      if (capture) {
+        capture.stop();
+        capture = null;
+      }
+      if ($("saveBtn")) $("saveBtn").disabled = false;
+      startVoice();
+    }, 400);
   };
 }
 
@@ -404,6 +519,7 @@ async function stopVoice() {
   await api("/api/abort", { method: "POST", body: "{}" });
   $("startBtn").disabled = false;
   $("stopBtn").disabled = true;
+  if ($("saveBtn")) $("saveBtn").disabled = false;
   setPhase("idle", "已停止", "可以再次启动");
 }
 

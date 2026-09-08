@@ -13,6 +13,7 @@ from jetson_client.tone import play_prompt_tone
 from jetson_client.wake_kws import KwsCooldown, KeywordSpotter, describe_kws, pcm_rms, wake_word
 
 OnEvent = Callable[[dict[str, Any]], None]
+ENDPOINT_SILENCE_SEC = 0.55
 
 
 def _is_listen_start(kind: str, data: Any) -> bool:
@@ -60,7 +61,7 @@ async def begin_command_stream(
     *,
     start_timeout: float = 5.0,
     max_duration: float = 12.0,
-    silence_sec: float = 0.85,
+    silence_sec: float = ENDPOINT_SILENCE_SEC,
     speech_rms: float = 0.012,
     skip_sec: float = 0.25,
     preroll_sec: float = 0.3,
@@ -138,7 +139,7 @@ async def collect_command_from_queue(
     *,
     start_timeout: float = 5.0,
     max_duration: float = 12.0,
-    silence_sec: float = 0.85,
+    silence_sec: float = ENDPOINT_SILENCE_SEC,
     speech_rms: float = 0.012,
     skip_sec: float = 0.25,
 ) -> bytes:
@@ -157,6 +158,127 @@ async def collect_command_from_queue(
     async for chunk in stream:
         parts.append(chunk)
     return b"".join(parts)
+
+
+def _drop_queued_pcm(incoming: asyncio.Queue) -> None:
+    """Throw away mic PCM captured before TTS actually started."""
+    kept: list[tuple[str, Any]] = []
+    while True:
+        try:
+            item = incoming.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        kind, _data = item
+        if kind == "pcm":
+            continue
+        kept.append(item)
+    for item in kept:
+        try:
+            incoming.put_nowait(item)
+        except Exception:
+            pass
+
+
+async def watch_wake_barge(
+    incoming: asyncio.Queue,
+    detector: Any,
+    cooldown: KwsCooldown | None,
+    abort_fn: Callable[..., Any],
+    *,
+    started: asyncio.Event,
+    done: asyncio.Event,
+) -> bool:
+    """After TTS starts, listen for 小溪小溪 and abort playback. True = hit."""
+    await started.wait()
+    if done.is_set() or detector is None:
+        return False
+    _drop_queued_pcm(incoming)
+    while not done.is_set():
+        try:
+            kind, data = await asyncio.wait_for(incoming.get(), timeout=0.15)
+        except asyncio.TimeoutError:
+            continue
+        if kind == "eof":
+            requeue_eof(incoming, kind)
+            return False
+        if kind != "pcm" or not data:
+            continue
+        if cooldown is not None and not cooldown.allow(len(data)):
+            continue
+        accept = getattr(detector, "accept_pcm", None)
+        if not callable(accept):
+            continue
+        try:
+            hit = accept(data)
+        except Exception as exc:
+            print(f"⚠️ wake kws: {type(exc).__name__}: {exc}", flush=True)
+            continue
+        if not hit:
+            continue
+        try:
+            await abort_fn()
+        except Exception:
+            pass
+        return True
+    return False
+
+
+async def listen_with_barge(session, chunks, incoming, detector, cooldown, **listen_kwargs):
+    """Host listen + optional wake-word abort while TTS is playing."""
+    started = asyncio.Event()
+    done = asyncio.Event()
+    user_end = listen_kwargs.pop("on_utterance_end", None)
+    user_event = listen_kwargs.pop("on_event", None)
+    user_audio = listen_kwargs.pop("on_audio", None)
+
+    def mark() -> None:
+        if callable(user_end):
+            user_end()
+
+    def on_event(ev: dict[str, Any]) -> None:
+        if isinstance(ev, dict) and ev.get("type") in {"tts_text", "audio"}:
+            started.set()
+        if callable(user_event):
+            user_event(ev)
+
+    def on_audio(pcm: bytes) -> None:
+        if pcm:
+            started.set()
+        if callable(user_audio):
+            user_audio(pcm)
+
+    listen_kwargs["on_utterance_end"] = mark
+    listen_kwargs["on_event"] = on_event
+    listen_kwargs["on_audio"] = on_audio
+
+    async def do_listen():
+        try:
+            return await run_gated_listen(session, chunks, **listen_kwargs)
+        finally:
+            done.set()
+            started.set()
+
+    task = asyncio.create_task(do_listen())
+    try:
+        barged = await watch_wake_barge(
+            incoming,
+            detector,
+            cooldown,
+            session.abort_playback,
+            started=started,
+            done=done,
+        )
+        return await task, barged
+    except BaseException:
+        done.set()
+        started.set()
+        if not task.done():
+            try:
+                await session.abort_playback()
+            except Exception:
+                pass
+        await task
+        raise
 
 
 async def pcm_source(device: str, chunk_bytes: int = 3200):
@@ -264,6 +386,7 @@ async def run_wake(
                 mic_task = asyncio.create_task(mic_to_queue())
                 cooldown = KwsCooldown()
                 did_turn = False
+                tts_bytes = 0
                 try:
                     while True:
                         kind, data = await incoming.get()
@@ -282,10 +405,12 @@ async def run_wake(
                             played = await asyncio.to_thread(play_prompt_tone)
                             print(f"wake=prompt played={played}", flush=True)
                             break
-                    stream = await begin_command_stream(incoming)
-                    if stream is None:
-                        print("wake=idle reason=no_speech", flush=True)
-                    else:
+                    skip_sec = 0.25
+                    while True:
+                        stream = await begin_command_stream(incoming, skip_sec=skip_sec)
+                        if stream is None:
+                            print("wake=idle reason=no_speech", flush=True)
+                            break
                         did_turn = True
                         streamed = 0
 
@@ -302,14 +427,35 @@ async def run_wake(
                             from jetson_client.voice_client import _AplayStream
 
                             sink = _AplayStream()
+                        tts_bytes = 0
+
+                        def on_audio(pcm: bytes, _sink=sink) -> None:
+                            nonlocal tts_bytes
+                            if pcm:
+                                tts_bytes += len(pcm)
+                            if _sink is not None:
+                                _sink.write(pcm)
+
                         try:
-                            result, decision = await run_gated_listen(
+                            (result, decision), barged = await listen_with_barge(
                                 session,
                                 chunks(),
+                                incoming,
+                                detector,
+                                cooldown,
                                 idle_after_speech=12.0 if play else 20.0,
-                                on_audio=sink.write if sink else None,
+                                on_audio=on_audio,
                                 on_event=on_event,
                             )
+                            if barged:
+                                print(f"wake=barge word={wake_word()}", flush=True)
+                                if on_event:
+                                    on_event(
+                                        {"type": "wake", "status": "hit", "word": wake_word()}
+                                    )
+                                detector.reset()
+                                skip_sec = 0.25
+                                continue
                             if result is None:
                                 print(
                                     f"wake=rejected bytes={streamed} "
@@ -340,6 +486,7 @@ async def run_wake(
                         finally:
                             if sink is not None:
                                 sink.close()
+                        break
                 finally:
                     stop_mic.set()
                     mic_task.cancel()
@@ -351,7 +498,7 @@ async def run_wake(
                         pass
                 detector.reset()
                 if did_turn:
-                    cooldown.arm()
+                    cooldown.arm(extra_sec=tts_bytes / 32000.0)
                 continue
             except HubConnectError as exc:
                 detail = str(exc)

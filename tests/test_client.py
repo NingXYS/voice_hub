@@ -127,3 +127,22 @@ class ClientTests(unittest.TestCase):
         types = asyncio.run(scenario())
         self.assertIn("stt", types)
         self.assertIn("turn_end", types)
+
+    def test_connect_reuses_open_socket(self):
+        async def scenario():
+            hub = VoiceHub(asr=NullASR(), tts=DummyTTS(), pipeline=Pipeline(llm=FakeLLM()))
+            async with websockets.serve(hub.handle, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                session = HubSession()
+                try:
+                    hello1 = await session.connect(f"ws://127.0.0.1:{port}", "tianlian_dual", 1)
+                    ws1 = session._ws
+                    hello2 = await session.connect(f"ws://127.0.0.1:{port}", "tianlian_dual", 1)
+                    return hello1.get("type"), hello2.get("type"), session._ws is ws1
+                finally:
+                    await session.close()
+
+        kind1, kind2, same = asyncio.run(scenario())
+        self.assertEqual(kind1, "hello_ok")
+        self.assertEqual(kind2, "hello_ok")
+        self.assertTrue(same)

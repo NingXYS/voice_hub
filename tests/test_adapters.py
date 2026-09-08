@@ -123,7 +123,8 @@ class AdapterPipelineTests(unittest.TestCase):
         self.assertTrue(any("多云" in item for item in seen))
         self.assertEqual(len(queries), 1)
         self.assertIn("长春天气怎么样", queries[0])
-        self.assertRegex(queries[0], r"\d{4}年")
+        self.assertRegex(queries[0], r"\d{1,2}月\d{1,2}日")
+        self.assertIn("最高气温", queries[0])
         self.assertEqual(result.route, "search")
 
     def test_midautumn_uses_local_calendar(self):
@@ -299,6 +300,146 @@ class AdapterPipelineTests(unittest.TestCase):
         self.assertIn("多云", today_ok)
         self.assertNotIn("套装", today_ok)
         self.assertLessEqual(len(today_ok), 100)
+        boilerplate = spoken_search_reply(
+            "天气：长春，温馨提示：根据天气变化调整出行时间。同时，还包含全国多地天气预报及生活指数信息。",
+            city="长春",
+            query="明天长春的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 7),
+        )
+        self.assertIn("没有查到", boilerplate)
+        self.assertNotIn("温馨提示", boilerplate)
+        self.assertNotIn("全国多地", boilerplate)
+        mixed = spoken_search_reply(
+            "天气：温馨提示：根据天气变化调整出行时间。\n"
+            "长春天气预报：明天多云，气温十八到二十六度。",
+            city="长春",
+            query="明天长春的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 7),
+        )
+        self.assertIn("二十六", mixed)
+        self.assertIn("明天", mixed)
+        self.assertNotIn("温馨提示", mixed)
+        stale = spoken_search_reply(
+            "长春2026年8月9日天气预报显示，当日多云，气温21~31℃。"
+            "温馨提示：根据天气变化调整出行时间。",
+            city="长春",
+            query="明天长春的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 7),
+        )
+        self.assertIn("没有查到", stale)
+        self.assertNotIn("31", stale)
+        news = spoken_search_reply(
+            "9月8日长春市最高气温19℃ 最低气温10℃ 较9月5日最高气温28℃下降了9℃。"
+            "长春天气的关键词是中雨。",
+            city="长春",
+            query="明天长春的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 7),
+        )
+        self.assertIn("19", news)
+        self.assertIn("10", news)
+        self.assertIn("明天", news)
+        self.assertNotIn("关键词", news)
+        self.assertNotIn("28", news)
+        portal = spoken_search_reply(
+            "8日9日两天 气温持续较低 最低气温一般为11～13℃ 最高气温一般为17～19℃ 10日后气温逐步回升。"
+            "预计今天白天，阴，有大雨；明天白天，阴，有小雨；明天夜间降水趋于结束。",
+            city="长春",
+            query="明天长春的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 7),
+        )
+        self.assertIn("明天", portal)
+        self.assertIn("小雨", portal)
+        self.assertIn("19", portal)
+        self.assertIn("11", portal)
+        self.assertNotIn("大雨", portal)
+        self.assertNotIn("逐步回升", portal)
+        self.assertLessEqual(len(portal), 40)
+        official = spoken_search_reply(
+            "早安，长春！今天最高气温29℃。明天白天到夜间小雨转晴。"
+            "长春市区今天白天最高气温29℃，夜间最低18℃。"
+            "未来一周最高气温27℃，最低气温7℃。"
+            "2026年9月9日长春天气预报显示，当天为星期三，天气以中雨为主，白天最高气温23℃，最低15℃。",
+            city="长春",
+            query="明天长春的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 8),
+        )
+        self.assertIn("明天", official)
+        self.assertIn("23", official)
+        self.assertIn("15", official)
+        self.assertNotIn("29", official)
+        self.assertNotIn("7", official)
+        self.assertTrue("中雨" in official or "小雨" in official)
+        mixed_cities = spoken_search_reply(
+            "8日夜间白山最低气温6℃，9日白天白城最高气温21℃。"
+            "8日9日两天最低气温一般为11～13℃，最高气温一般为17～19℃。"
+            "今天白天长春阴有大雨，最高16℃，最低10℃。",
+            city="长春",
+            query="长春天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 8),
+        )
+        self.assertIn("今天", mixed_cities)
+        self.assertIn("16", mixed_cities)
+        self.assertIn("10", mixed_cities)
+        self.assertIn("大雨", mixed_cities)
+        self.assertNotIn("白山", mixed_cities)
+        self.assertNotIn("白城", mixed_cities)
+        self.assertNotIn("21", mixed_cities)
+        self.assertNotIn("11", mixed_cities)
+        self.assertNotIn("19", mixed_cities)
+        today_obs = spoken_search_reply(
+            "9月8日长春市最高气温19℃ 最低气温10℃。长春天气的关键词是中雨。"
+            "今天白天长春阴，气温10.2℃～15.8℃。"
+            "8日9日两天最低气温一般为11～13℃，最高气温一般为17～19℃。",
+            city="长春",
+            query="今天天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 8),
+        )
+        self.assertIn("今天", today_obs)
+        self.assertIn("15", today_obs)
+        self.assertIn("10", today_obs)
+        self.assertIn("阴", today_obs)
+        self.assertNotIn("19", today_obs)
+        self.assertNotIn("中雨", today_obs)
+        self.assertNotIn("11", today_obs)
+        forecast_rain = spoken_search_reply(
+            "预计今天白天，阴，有大雨。"
+            "09月08日长春阴转晴，8℃～20℃。"
+            "下周一降雨来袭，外出备好雨具。",
+            city="长春",
+            query="今天天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 8),
+        )
+        self.assertIn("今天", forecast_rain)
+        self.assertIn("20", forecast_rain)
+        self.assertIn("8", forecast_rain)
+        self.assertTrue("阴转晴" in forecast_rain or "晴" in forecast_rain)
+        self.assertNotIn("大雨", forecast_rain)
+        self.assertNotIn("雨具", forecast_rain)
+        mixed_sky = spoken_search_reply(
+            "今天白天长春多云，最高19℃，最低10℃。"
+            "今天有大雨。",
+            city="长春",
+            query="今天天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 8),
+        )
+        self.assertIn("多云", mixed_sky)
+        self.assertNotIn("大雨", mixed_sky)
+        summary_wrong_day = spoken_search_reply(
+            "长春今天大雨，最高23℃，最低15℃。"
+            "09月08日长春阴转晴，8℃～20℃。"
+            "2026年9月9日长春天气预报显示，当天为星期三，天气以中雨为主，白天最高气温23℃，最低15℃。",
+            city="长春",
+            query="今天长春朝阳区的天气怎么样",
+            now=__import__("datetime").datetime(2026, 9, 8),
+        )
+        self.assertIn("今天", summary_wrong_day)
+        self.assertTrue("阴转晴" in summary_wrong_day or "晴" in summary_wrong_day)
+        self.assertIn("20", summary_wrong_day)
+        self.assertIn("8", summary_wrong_day)
+        self.assertNotIn("大雨", summary_wrong_day)
+        self.assertNotIn("中雨", summary_wrong_day)
+        self.assertNotIn("23", summary_wrong_day)
+        self.assertNotIn("15", summary_wrong_day)
 
     def test_working_is_not_a_city(self):
         from server.memory import extract_city

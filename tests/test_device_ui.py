@@ -270,13 +270,13 @@ class DeviceApiTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_abort_without_connect_is_speakable(self):
+    def test_abort_without_connect_is_ok(self):
         async def scenario():
             transport = httpx.ASGITransport(app=create_app())
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                body = (await client.post("/api/abort")).json()
-                self.assertFalse(body.get("ok"))
-                self.assertIn("连", body.get("error") or "")
+                res = await client.post("/api/abort")
+                self.assertEqual(res.status_code, 200)
+                self.assertTrue(res.json().get("ok"))
 
         asyncio.run(scenario())
 
@@ -371,8 +371,15 @@ class DeviceApiTests(unittest.TestCase):
                 self.assertIn("no-store", (js.headers.get("cache-control") or "").lower())
                 self.assertIn("小溪小溪", js.text)
                 home_text = home.text
-                self.assertIn("dash.js?v=dash-5", home_text)
-                self.assertIn("msgChain", (await client.get("/static/dash.js")).text)
+                self.assertIn("dash.js?v=dash-9", home_text)
+                js_text = (await client.get("/static/dash.js")).text
+                self.assertIn("msgChain", js_text)
+                self.assertIn("allowWhileStarting", js_text)
+                self.assertIn("语音正在进行", js_text)
+                self.assertIn("playWakeDing", js_text)
+                ding = await client.get("/static/wake_ding.wav")
+                self.assertEqual(ding.status_code, 200)
+                self.assertTrue(ding.content.startswith(b"RIFF"))
 
         asyncio.run(scenario())
 
@@ -514,7 +521,7 @@ class DeviceApiTests(unittest.TestCase):
             schema_version = 1
             bridge_error = ""
 
-            async def listen_stream(self, chunks, idle_after_speech=8.0, on_audio=None, on_event=None):
+            async def listen_stream(self, chunks, idle_after_speech=8.0, on_audio=None, on_event=None, **kwargs):
                 async for _pcm in chunks:
                     pass
                 if on_event:
@@ -571,6 +578,40 @@ class DeviceApiTests(unittest.TestCase):
                 self.assertIn("VOICE_SPEAKER_VERIFY_MODE=shadow", text)
 
         asyncio.run(scenario())
+
+    def test_connect_while_voice_ws_reuses_session(self):
+        from starlette.testclient import TestClient
+
+        class FakeSession:
+            connected = True
+            hello = {"type": "hello_ok"}
+            url = "ws://127.0.0.1:8765"
+            robot_id = "tianlian_dual"
+            schema_version = 1
+            bridge_error = ""
+            connect_calls = 0
+
+            async def connect(self, url, robot_id, schema_version):
+                self.connect_calls += 1
+                raise AssertionError("must not reconnect while voice is live")
+
+            async def abort_playback(self):
+                return None
+
+            async def close(self):
+                return None
+
+        save({"url": "ws://127.0.0.1:8765", "robot_id": "tianlian_dual", "schema_version": 1})
+        session = FakeSession()
+        with TestClient(create_app(session)) as client:
+            with client.websocket_connect("/ws/voice") as _ws:
+                body = client.post("/api/connect").json()
+                self.assertTrue(body.get("ok"), body)
+                self.assertEqual(session.connect_calls, 0)
+                save({"url": "ws://10.1.1.1:8765", "robot_id": "tianlian_dual"})
+                res = client.post("/api/connect")
+                self.assertEqual(res.status_code, 409)
+                self.assertIn("停止", res.json().get("error") or "")
 
     def test_enroll_rejected_while_voice_ws_live(self):
         from starlette.testclient import TestClient

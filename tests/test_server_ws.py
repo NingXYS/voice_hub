@@ -931,6 +931,514 @@ class WebsocketServerTests(unittest.TestCase):
         self.assertIn("tts_text", types)
         self.assertIn("audio", types)
 
+    def test_dialog_listen_native_chat_skips_chat_text(self):
+        from server.providers.realtime_doubao import RealtimeEvent
+
+        calls: list[str] = []
+
+        class FakeDialog:
+            def __init__(self, on_asr=None):
+                self.on_asr = on_asr
+                self.alive = True
+                self.muted = False
+                self.dialog_id = "dlg-native-1"
+                self._queue: asyncio.Queue = asyncio.Queue()
+
+            async def start(self, **kwargs):
+                calls.append("start")
+
+            async def feed(self, pcm):
+                return None
+
+            def begin_listen(self):
+                calls.append("begin")
+
+            async def end_utterance(self):
+                calls.append("end")
+                await self._queue.put(RealtimeEvent(kind="text", text="端到端在。"))
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x11\x00" * 8))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_asr_final(self, timeout=8.0):
+                return "你好呀"
+
+            async def chat_text(self, text):
+                calls.append("chat:" + text)
+                raise AssertionError("voice chat must use native dialog audio")
+
+            async def chat_tts_text(self, text, start=True, end=True):
+                calls.append("tts:" + str(text))
+                raise AssertionError("voice chat must not take over TTS")
+
+            async def wait_event(self, timeout=2.0):
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return RealtimeEvent(kind="timeout")
+                return item if item is not None else RealtimeEvent(kind="closed")
+
+            def mute(self):
+                self.muted = True
+                calls.append("mute")
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+            def drain(self):
+                self.mute()
+
+            async def finish(self):
+                return None
+
+            async def close(self):
+                return None
+
+        async def scenario():
+            hub = VoiceHub(
+                asr=NullASR(),
+                tts=DummyTTS(),
+                pipeline=Pipeline(llm=FakeLLM()),
+                realtime_factory=FakeDialog,
+            )
+            async with websockets.serve(hub.handle, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+                    await ws.send(json.dumps({
+                        "type": "hello",
+                        "robot_id": "tianlian_dual",
+                        "schema_version": 1,
+                    }))
+                    await ws.recv()
+                    await ws.send(json.dumps({"type": "listen", "state": "start"}))
+                    await ws.send(b"\x00\x00" * 160)
+                    await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+                    events = []
+                    audio = b""
+                    while True:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                        if isinstance(msg, bytes):
+                            audio += msg
+                            events.append({"type": "audio"})
+                            continue
+                        payload = json.loads(msg)
+                        events.append(payload)
+                        if payload.get("type") == "turn_end":
+                            break
+                    return events, audio
+
+        events, audio = asyncio.run(scenario())
+        self.assertIn("end", calls)
+        self.assertFalse(any(c.startswith("chat:") for c in calls))
+        self.assertNotIn("mute", calls)
+        self.assertEqual(audio, b"\x11\x00" * 8)
+        self.assertTrue(any(e.get("type") == "stt" and "你好" in (e.get("text") or "") for e in events))
+        self.assertTrue(any(e.get("type") == "tts_text" for e in events))
+
+    def test_dialog_listen_knowledge_mutes_native(self):
+        from server.providers.realtime_doubao import RealtimeEvent
+
+        calls: list[str] = []
+
+        class FakeDialog:
+            def __init__(self, on_asr=None):
+                self.on_asr = on_asr
+                self.alive = True
+                self.muted = False
+                self.dialog_id = "dlg-native-kn"
+                self._queue: asyncio.Queue = asyncio.Queue()
+
+            async def start(self, **kwargs):
+                return None
+
+            async def feed(self, pcm):
+                return None
+
+            def begin_listen(self):
+                return None
+
+            async def end_utterance(self):
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x99\x00" * 8))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_asr_final(self, timeout=8.0):
+                return "你有几个关节"
+
+            async def chat_text(self, text):
+                calls.append("chat")
+                raise AssertionError("knowledge must not use chat_text")
+
+            async def chat_tts_text(self, text, start=True, end=True):
+                calls.append("tts:" + str(text))
+                await self._queue.put(RealtimeEvent(kind="text", text=str(text)))
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x22\x00" * 8))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_event(self, timeout=2.0):
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return RealtimeEvent(kind="timeout")
+                return item if item is not None else RealtimeEvent(kind="closed")
+
+            def mute(self):
+                self.muted = True
+                calls.append("mute")
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+            def drain(self):
+                self.mute()
+
+            async def finish(self):
+                return None
+
+            async def close(self):
+                return None
+
+        async def scenario():
+            hub = VoiceHub(
+                asr=NullASR(),
+                tts=DummyTTS(),
+                pipeline=Pipeline(llm=FakeLLM()),
+                realtime_factory=FakeDialog,
+            )
+            async with websockets.serve(hub.handle, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+                    await ws.send(json.dumps({
+                        "type": "hello",
+                        "robot_id": "tianlian_dual",
+                        "schema_version": 1,
+                    }))
+                    await ws.recv()
+                    await ws.send(json.dumps({"type": "listen", "state": "start"}))
+                    await ws.send(b"\x00\x00" * 160)
+                    await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+                    events = []
+                    audio = b""
+                    while True:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                        if isinstance(msg, bytes):
+                            audio += msg
+                            continue
+                        payload = json.loads(msg)
+                        events.append(payload)
+                        if payload.get("type") == "turn_end":
+                            break
+                    return events, audio
+
+        events, audio = asyncio.run(scenario())
+        self.assertIn("mute", calls)
+        self.assertTrue(any(c.startswith("tts:") for c in calls))
+        self.assertNotIn("chat", calls)
+        self.assertNotIn("robot_command", [e.get("type") for e in events])
+        self.assertTrue(any("关节" in (e.get("text") or "") for e in events if e.get("type") == "tts_text"))
+        self.assertEqual(audio, b"\x22\x00" * 8)
+
+    def test_dialog_listen_empty_asr_does_not_leak_native(self):
+        from server.providers.realtime_doubao import RealtimeEvent
+
+        calls: list[str] = []
+
+        class FakeDialog:
+            def __init__(self, on_asr=None):
+                self.on_asr = on_asr
+                self.alive = True
+                self.muted = False
+                self.dialog_id = "dlg-empty"
+                self._queue: asyncio.Queue = asyncio.Queue()
+
+            async def start(self, **kwargs):
+                return None
+
+            async def feed(self, pcm):
+                return None
+
+            def begin_listen(self):
+                return None
+
+            async def end_utterance(self):
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x77\x00" * 8))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_asr_final(self, timeout=8.0):
+                return ""
+
+            async def chat_text(self, text):
+                calls.append("chat")
+                return None
+
+            async def wait_event(self, timeout=2.0):
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return RealtimeEvent(kind="timeout")
+                return item if item is not None else RealtimeEvent(kind="closed")
+
+            def mute(self):
+                self.muted = True
+                calls.append("mute")
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+            def drain(self):
+                self.mute()
+
+            async def finish(self):
+                return None
+
+            async def close(self):
+                return None
+
+        async def scenario():
+            hub = VoiceHub(
+                asr=NullASR(),
+                tts=DummyTTS(),
+                pipeline=Pipeline(llm=FakeLLM()),
+                realtime_factory=FakeDialog,
+            )
+            async with websockets.serve(hub.handle, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+                    await ws.send(json.dumps({
+                        "type": "hello",
+                        "robot_id": "tianlian_dual",
+                        "schema_version": 1,
+                    }))
+                    await ws.recv()
+                    await ws.send(json.dumps({"type": "listen", "state": "start"}))
+                    await ws.send(b"\x00\x00" * 160)
+                    await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+                    audio = 0
+                    ended = False
+                    while True:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                        if isinstance(msg, bytes):
+                            audio += len(msg)
+                            continue
+                        if json.loads(msg).get("type") == "turn_end":
+                            ended = True
+                            break
+                    return audio, ended
+
+        audio, ended = asyncio.run(scenario())
+        self.assertIn("mute", calls)
+        self.assertNotIn("chat", calls)
+        self.assertEqual(audio, 0)
+        self.assertTrue(ended)
+
+    def test_dialog_listen_control_still_commands_first(self):
+        from server.providers.realtime_doubao import RealtimeEvent
+
+        class FakeDialog:
+            def __init__(self, on_asr=None):
+                self.on_asr = on_asr
+                self.alive = True
+                self.muted = False
+                self.dialog_id = "dlg-ctrl"
+                self._queue: asyncio.Queue = asyncio.Queue()
+
+            async def start(self, **kwargs):
+                return None
+
+            async def feed(self, pcm):
+                return None
+
+            def begin_listen(self):
+                return None
+
+            async def end_utterance(self):
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x01\x00" * 4))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_asr_final(self, timeout=8.0):
+                return "左臂向上10厘米"
+
+            async def chat_text(self, text):
+                raise AssertionError("control must not chat_text")
+
+            async def chat_tts_text(self, text, start=True, end=True):
+                await self._queue.put(RealtimeEvent(kind="text", text=str(text)))
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x02\x00" * 4))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_event(self, timeout=2.0):
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return RealtimeEvent(kind="timeout")
+                return item if item is not None else RealtimeEvent(kind="closed")
+
+            def mute(self):
+                self.muted = True
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+            def drain(self):
+                self.mute()
+
+            async def finish(self):
+                return None
+
+            async def close(self):
+                return None
+
+        async def scenario():
+            hub = VoiceHub(
+                asr=NullASR(),
+                tts=DummyTTS(),
+                pipeline=Pipeline(llm=FakeLLM()),
+                realtime_factory=FakeDialog,
+            )
+            async with websockets.serve(hub.handle, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+                    await ws.send(json.dumps({
+                        "type": "hello",
+                        "robot_id": "tianlian_dual",
+                        "schema_version": 1,
+                    }))
+                    await ws.recv()
+                    await ws.send(json.dumps({"type": "listen", "state": "start"}))
+                    await ws.send(b"\x00\x00" * 160)
+                    await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+                    types = []
+                    while True:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                        if isinstance(msg, bytes):
+                            types.append("audio")
+                            continue
+                        payload = json.loads(msg)
+                        types.append(payload.get("type"))
+                        if payload.get("type") == "robot_command":
+                            self.assertEqual(payload["commands"][0]["action"], "move_cartesian")
+                        if payload.get("type") == "turn_end":
+                            break
+                    return types
+
+        types = asyncio.run(scenario())
+        self.assertIn("robot_command", types)
+        self.assertLess(types.index("robot_command"), types.index("tts_text"))
+        self.assertIn("audio", types)
+
+    def test_dialog_listen_search_mutes_native(self):
+        from server.providers.realtime_doubao import RealtimeEvent
+
+        calls: list[str] = []
+
+        class FakeDialog:
+            def __init__(self, on_asr=None):
+                self.on_asr = on_asr
+                self.alive = True
+                self.muted = False
+                self.dialog_id = "dlg-search-listen"
+                self.city = "长春"
+                self._queue: asyncio.Queue = asyncio.Queue()
+
+            async def start(self, **kwargs):
+                return None
+
+            async def feed(self, pcm):
+                return None
+
+            def begin_listen(self):
+                return None
+
+            async def end_utterance(self):
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x33\x00" * 8))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_asr_final(self, timeout=8.0):
+                return "长春天气怎么样"
+
+            async def chat_text(self, text):
+                calls.append("chat")
+                raise AssertionError("search must not chat_text")
+
+            async def chat_tts_text(self, text, start=True, end=True):
+                calls.append("tts:" + str(text))
+                await self._queue.put(RealtimeEvent(kind="text", text=str(text)))
+                await self._queue.put(RealtimeEvent(kind="audio", pcm=b"\x44\x00" * 8))
+                await self._queue.put(RealtimeEvent(kind="ended"))
+
+            async def wait_event(self, timeout=2.0):
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return RealtimeEvent(kind="timeout")
+                return item if item is not None else RealtimeEvent(kind="closed")
+
+            def mute(self):
+                self.muted = True
+                calls.append("mute")
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+            def drain(self):
+                self.mute()
+
+            async def finish(self):
+                return None
+
+            async def close(self):
+                return None
+
+        async def scenario():
+            hub = VoiceHub(
+                asr=NullASR(),
+                tts=DummyTTS(),
+                pipeline=Pipeline(llm=FakeLLM(), search_fn=lambda q: "天气：长春今天多云，气温二十二度。"),
+                realtime_factory=FakeDialog,
+            )
+            async with websockets.serve(hub.handle, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+                    await ws.send(json.dumps({
+                        "type": "hello",
+                        "robot_id": "tianlian_dual",
+                        "schema_version": 1,
+                    }))
+                    await ws.recv()
+                    await ws.send(json.dumps({"type": "listen", "state": "start"}))
+                    await ws.send(b"\x00\x00" * 160)
+                    await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+                    texts = []
+                    audio = b""
+                    while True:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=3)
+                        if isinstance(msg, bytes):
+                            audio += msg
+                            continue
+                        payload = json.loads(msg)
+                        if payload.get("type") == "tts_text":
+                            texts.append(payload.get("text") or "")
+                        if payload.get("type") == "turn_end":
+                            break
+                    return texts, audio
+
+        texts, audio = asyncio.run(scenario())
+        blob = "".join(texts)
+        self.assertIn("mute", calls)
+        self.assertNotIn("chat", calls)
+        self.assertIn("我查一下", blob)
+        self.assertIn("多云", blob)
+        self.assertNotIn(b"\x33\x00", audio)
+        self.assertIn(b"\x44\x00", audio)
+
 
 if __name__ == "__main__":
     unittest.main()

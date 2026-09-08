@@ -19,9 +19,8 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from device_ui import client_settings
 from device_ui.wavutil import pcm_s16le_to_wav
 from jetson_client.session import HubConnectError, HubSession
-from jetson_client.speaker_gate import run_gated_listen
 from jetson_client.wake_kws import KwsCooldown, describe_kws, wake_word as kws_wake_word
-from jetson_client.wake_loop import begin_command_stream, requeue_eof
+from jetson_client.wake_loop import begin_command_stream, listen_with_barge, requeue_eof
 
 _WAKE_UNSET = object()
 
@@ -116,32 +115,52 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
             }
         )
 
+    def _connected_payload(hello: dict[str, Any]) -> dict[str, Any]:
+        session = state.session
+        return {
+            "ok": True,
+            "connected": True,
+            "hello": hello,
+            "bridge_error": session.bridge_error,
+            "bridge_loaded": bool(getattr(session, "bridge_loaded", False)),
+            "last_command": getattr(session, "last_command", None),
+            "last_bridge_status": getattr(session, "last_bridge_status", "") or "",
+            "robot_publish_enabled": _robot_publish_enabled(),
+            "massage_enabled": _massage_enabled(),
+        }
+
     async def api_connect(_: Request):
         view = client_settings.public_view()
-        try:
-            hello = await state.session.connect(
-                str(view["url"]),
-                str(view["robot_id"]),
-                int(view["schema_version"]),
+        url = str(view["url"]).strip()
+        robot_id = str(view["robot_id"]).strip()
+        schema_version = int(view["schema_version"])
+        session = state.session
+        if state.voice_ws > 0:
+            same = (
+                session.connected
+                and session.url == url
+                and session.robot_id == robot_id
+                and int(session.schema_version or 0) == schema_version
             )
+            if not same:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": "语音正在进行，请先停止再更换主机。",
+                        "connected": session.connected,
+                    },
+                    status_code=409,
+                )
+            hello = session.hello if isinstance(session.hello, dict) else {"type": "hello_ok"}
+            return JSONResponse(_connected_payload(hello))
+        try:
+            hello = await session.connect(url, robot_id, schema_version)
         except HubConnectError as exc:
             return JSONResponse({"ok": False, "error": str(exc), "connected": False})
         if hello.get("type") != "hello_ok":
             reason = str(hello.get("reason") or hello.get("message") or "主机拒绝连接")
             return JSONResponse({"ok": False, "error": reason, "hello": hello, "connected": False})
-        return JSONResponse(
-            {
-                "ok": True,
-                "connected": True,
-                "hello": hello,
-                "bridge_error": state.session.bridge_error,
-                "bridge_loaded": bool(getattr(state.session, "bridge_loaded", False)),
-                "last_command": getattr(state.session, "last_command", None),
-                "last_bridge_status": getattr(state.session, "last_bridge_status", "") or "",
-                "robot_publish_enabled": _robot_publish_enabled(),
-                "massage_enabled": _massage_enabled(),
-            }
-        )
+        return JSONResponse(_connected_payload(hello))
 
     async def api_disconnect(_: Request):
         from jetson_client.massage import close_runtime
@@ -311,9 +330,86 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
                     return
                 outgoing.put_nowait(("json", ev))
 
+            tts_bytes = 0
+
             def on_audio(pcm: bytes) -> None:
+                nonlocal tts_bytes
                 if pcm:
+                    tts_bytes += len(pcm)
                     outgoing.put_nowait(("bin", pcm))
+
+            def emit_rejected(decision: dict[str, Any]) -> None:
+                outgoing.put_nowait(
+                    (
+                        "json",
+                        {
+                            "type": "wake",
+                            "status": "rejected",
+                            "word": kws_wake_word(),
+                            "message": "未通过声纹，请本人再说",
+                            "reason": decision.get("reason"),
+                            "score": decision.get("score"),
+                            "display_name": decision.get("display_name"),
+                            "mode": decision.get("mode"),
+                        },
+                    )
+                )
+
+            async def host_listen(chunks):
+                nonlocal tts_bytes
+                tts_bytes = 0
+                return await listen_with_barge(
+                    session,
+                    chunks,
+                    incoming,
+                    detector,
+                    cooldown,
+                    on_event=on_event,
+                    on_audio=on_audio,
+                )
+
+            async def command_loop(*, skip_sec: float = 0.25) -> bool:
+                did_turn = False
+                while True:
+                    stream = await begin_command_stream(incoming, skip_sec=skip_sec)
+                    if stream is None:
+                        print("wake=idle reason=no_speech", flush=True)
+                        outgoing.put_nowait(
+                            ("json", {"type": "wake", "status": "idle", "reason": "no_speech"})
+                        )
+                        return did_turn
+                    streamed = 0
+                    print("wake=stream", flush=True)
+                    outgoing.put_nowait(
+                        ("json", {"type": "wake", "status": "listen", "word": kws_wake_word()})
+                    )
+
+                    async def live_chunks():
+                        nonlocal streamed
+                        async for part in stream:
+                            streamed += len(part)
+                            yield part
+
+                    (result, decision), barged = await host_listen(live_chunks())
+                    if barged:
+                        print("wake=barge word=" + kws_wake_word(), flush=True)
+                        outgoing.put_nowait(
+                            ("json", {"type": "wake", "status": "hit", "word": kws_wake_word()})
+                        )
+                        if detector is not None:
+                            detector.reset()
+                        skip_sec = 0.25
+                        continue
+                    if result is None:
+                        print(
+                            f"wake=rejected bytes={streamed} reason={decision.get('reason')}",
+                            flush=True,
+                        )
+                        emit_rejected(decision)
+                        return did_turn
+                    did_turn = True
+                    print(f"wake=listen bytes={streamed} streamed=1", flush=True)
+                    return True
 
             async def run_listen_from_queue():
                 async def chunks():
@@ -332,25 +428,18 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
                         ):
                             return
 
-                result, decision = await run_gated_listen(
-                    session, chunks(), on_event=on_event, on_audio=on_audio
-                )
-                if result is None:
+                (result, decision), barged = await host_listen(chunks())
+                if barged:
+                    print("wake=barge word=" + kws_wake_word(), flush=True)
                     outgoing.put_nowait(
-                        (
-                            "json",
-                            {
-                                "type": "wake",
-                                "status": "rejected",
-                                "word": kws_wake_word(),
-                                "message": "未通过声纹，请本人再说",
-                                "reason": decision.get("reason"),
-                                "score": decision.get("score"),
-                                "display_name": decision.get("display_name"),
-                                "mode": decision.get("mode"),
-                            },
-                        )
+                        ("json", {"type": "wake", "status": "hit", "word": kws_wake_word()})
                     )
+                    if detector is not None:
+                        detector.reset()
+                    await command_loop(skip_sec=0.25)
+                    return
+                if result is None:
+                    emit_rejected(decision)
 
             while True:
                 kind, data = await incoming.get()
@@ -375,55 +464,18 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
                     continue
                 if not cooldown.allow(len(data)):
                     continue
-                if not detector.accept_pcm(data):
+                try:
+                    hit = detector.accept_pcm(data)
+                except Exception as exc:
+                    print(f"⚠️ wake kws: {type(exc).__name__}: {exc}", flush=True)
+                    continue
+                if not hit:
                     continue
                 print(f"wake=hit word={kws_wake_word()}", flush=True)
                 outgoing.put_nowait(("json", {"type": "wake", "status": "hit", "word": kws_wake_word()}))
                 did_turn = False
                 try:
-                    stream = await begin_command_stream(incoming)
-                    if stream is None:
-                        print("wake=idle reason=no_speech", flush=True)
-                        outgoing.put_nowait(("json", {"type": "wake", "status": "idle", "reason": "no_speech"}))
-                    else:
-                        streamed = 0
-                        print("wake=stream", flush=True)
-                        outgoing.put_nowait(
-                            ("json", {"type": "wake", "status": "listen", "word": kws_wake_word()})
-                        )
-
-                        async def live_chunks():
-                            nonlocal streamed
-                            async for part in stream:
-                                streamed += len(part)
-                                yield part
-
-                        result, decision = await run_gated_listen(
-                            session, live_chunks(), on_event=on_event, on_audio=on_audio
-                        )
-                        if result is None:
-                            print(
-                                f"wake=rejected bytes={streamed} reason={decision.get('reason')}",
-                                flush=True,
-                            )
-                            outgoing.put_nowait(
-                                (
-                                    "json",
-                                    {
-                                        "type": "wake",
-                                        "status": "rejected",
-                                        "word": kws_wake_word(),
-                                        "message": "未通过声纹，请本人再说",
-                                        "reason": decision.get("reason"),
-                                        "score": decision.get("score"),
-                                        "display_name": decision.get("display_name"),
-                                        "mode": decision.get("mode"),
-                                    },
-                                )
-                            )
-                        else:
-                            did_turn = True
-                            print(f"wake=listen bytes={streamed} streamed=1", flush=True)
+                    did_turn = await command_loop()
                 except HubConnectError as exc:
                     outgoing.put_nowait(("json", {"type": "error", "message": str(exc)}))
                 except Exception as exc:
@@ -433,7 +485,7 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
                     if detector is not None:
                         detector.reset()
                     if did_turn:
-                        cooldown.arm()
+                        cooldown.arm(extra_sec=tts_bytes / 32000.0)
                     outgoing.put_nowait(("json", {"type": "wake", "status": "waiting", "word": kws_wake_word()}))
 
         reader_task = asyncio.create_task(reader())
@@ -441,6 +493,12 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
         turns_task = asyncio.create_task(turns())
         try:
             await turns_task
+        except Exception as exc:
+            print(f"⚠️ device_ui voice loop: {type(exc).__name__}: {exc}", flush=True)
+            try:
+                await websocket.send_json({"type": "error", "message": "语音通道出错，请重新启动语音。"})
+            except Exception:
+                pass
         finally:
             from jetson_client.massage import close_runtime
 
@@ -462,8 +520,10 @@ def create_app(session: HubSession | None = None, wake_detector=_WAKE_UNSET) -> 
         close_runtime()
         try:
             await state.session.abort_playback()
-        except HubConnectError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except HubConnectError:
+            pass
+        except Exception as exc:
+            print(f"⚠️ device_ui abort: {type(exc).__name__}: {exc}", flush=True)
         return JSONResponse({"ok": True})
 
     async def api_memory(request: Request):

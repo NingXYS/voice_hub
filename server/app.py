@@ -87,12 +87,20 @@ class VoiceHub:
             async with send_lock:
                 await websocket.send(data)
 
-        async def run_turn(spoken_text: str, token: asyncio.Event) -> None:
+        async def run_turn(
+            spoken_text: str,
+            token: asyncio.Event,
+            *,
+            native_reply: bool = False,
+            origin: float | None = None,
+        ) -> None:
             nonlocal speaking
             cleaned = (spoken_text or "").strip()
             if not cleaned or _is_echo(cleaned, recent_tts):
                 if cleaned:
                     print(f"⚠️ ignore echo/stt={cleaned[:24]!r}", flush=True)
+                if dialog is not None:
+                    dialog.mute()
                 try:
                     await send_json(protocol.turn_end())
                 except Exception:
@@ -115,6 +123,8 @@ class VoiceHub:
                     memory=memory,
                     dialog=dialog,
                     refresh_dialog=refresh_dialog,
+                    native_reply=native_reply,
+                    origin=origin,
                 )
             except Exception as exc:
                 print(f"⚠️ turn failed: {type(exc).__name__}: {exc}", flush=True)
@@ -126,7 +136,13 @@ class VoiceHub:
             finally:
                 speaking = False
 
-        async def run_asr_turn(captured: bytes, token: asyncio.Event) -> None:
+        async def run_asr_turn(
+            captured: bytes,
+            token: asyncio.Event,
+            *,
+            native_reply: bool = False,
+            origin: float | None = None,
+        ) -> None:
             text = ""
             if self.asr is not None:
                 try:
@@ -142,7 +158,7 @@ class VoiceHub:
                     print(f"⚠️ ASR failed: {type(exc).__name__}: {msg}", flush=True)
                     if any(mark in msg for mark in ("请", "密钥", "连不上", "识别")):
                         await send_json(protocol.error(msg))
-            await run_turn(text or "", token)
+            await run_turn(text or "", token, native_reply=native_reply, origin=origin)
 
         async def close_live_asr() -> None:
             nonlocal live_asr
@@ -319,6 +335,7 @@ class VoiceHub:
                         if dialog is not None and dialog.alive:
                             async def finish_dialog() -> None:
                                 text = ""
+                                origin = time.monotonic()
                                 try:
                                     await dialog.end_utterance()
                                     text = await dialog.wait_asr_final()
@@ -327,10 +344,18 @@ class VoiceHub:
                                     print(f"⚠️ dialog ASR failed: {type(exc).__name__}: {msg}", flush=True)
                                     if any(mark in msg for mark in ("请", "密钥", "连不上", "识别", "端到端")):
                                         await send_json(protocol.error(msg))
+                                if not (text or "").strip():
+                                    text = last_partial
+                                asr_ms = int((time.monotonic() - origin) * 1000)
+                                print(f"asr_final_ms={asr_ms} text={(text or '')[:24]!r}", flush=True)
                                 if not (text or "").strip() and captured and self.asr is not None:
-                                    await run_asr_turn(captured, abort)
+                                    await run_asr_turn(
+                                        captured, abort, native_reply=True, origin=origin
+                                    )
                                     return
-                                await run_turn(text or "", abort)
+                                await run_turn(
+                                    text or "", abort, native_reply=True, origin=origin
+                                )
 
                             turn_task = asyncio.create_task(finish_dialog())
                         else:
@@ -432,8 +457,10 @@ class VoiceHub:
         memory: ConversationMemory | None = None,
         dialog: DoubaoRealtimeSession | None = None,
         refresh_dialog=None,
+        native_reply: bool = False,
+        origin: float | None = None,
     ) -> None:
-        started = time.monotonic()
+        started = origin if origin is not None else time.monotonic()
         first_audio_logged = False
         text = (text or "").strip()
         if text:
@@ -465,6 +492,7 @@ class VoiceHub:
                     memory,
                     dialog,
                     started,
+                    native_reply=native_reply,
                 )
                 return
             except Exception as exc:
@@ -488,6 +516,7 @@ class VoiceHub:
                                 memory,
                                 dialog,
                                 started,
+                                native_reply=False,
                             )
                             return
                         except Exception as exc2:
@@ -508,7 +537,13 @@ class VoiceHub:
         memory,
         dialog: DoubaoRealtimeSession,
         started: float,
+        native_reply: bool = False,
     ) -> None:
+        print(
+            f"dialog_route={decision.route} native_reply={int(bool(native_reply))} "
+            f"asr={text[:24]!r}",
+            flush=True,
+        )
         if decision.takeover or decision.route == "search":
             dialog.mute()
         else:
@@ -591,21 +626,52 @@ class VoiceHub:
             await send_json(protocol.turn_end())
             return
 
-        drain = getattr(dialog, "drain", None)
-        if callable(drain):
-            drain()
-        await dialog.chat_text(text)
-        spoken, got_audio = await self._pump_dialog(
-            dialog,
-            abort,
-            send_json,
-            send_bin,
-            on_first_audio,
-            until="ended",
-            timeout=30.0,
-        )
-        if spoken:
-            collected.append(spoken)
+        if native_reply:
+            spoken, got_audio = await self._pump_dialog(
+                dialog,
+                abort,
+                send_json,
+                send_bin,
+                on_first_audio,
+                until="ended",
+                timeout=30.0,
+                first_audio=5.0,
+            )
+            if spoken:
+                collected.append(spoken)
+            if not got_audio and not abort.is_set():
+                print("⚠️ native dialog had no audio; falling back to chat_text", flush=True)
+                drain = getattr(dialog, "drain", None)
+                if callable(drain):
+                    drain()
+                await dialog.chat_text(text)
+                spoken, got_audio = await self._pump_dialog(
+                    dialog,
+                    abort,
+                    send_json,
+                    send_bin,
+                    on_first_audio,
+                    until="ended",
+                    timeout=30.0,
+                )
+                if spoken:
+                    collected.append(spoken)
+        else:
+            drain = getattr(dialog, "drain", None)
+            if callable(drain):
+                drain()
+            await dialog.chat_text(text)
+            spoken, got_audio = await self._pump_dialog(
+                dialog,
+                abort,
+                send_json,
+                send_bin,
+                on_first_audio,
+                until="ended",
+                timeout=30.0,
+            )
+            if spoken:
+                collected.append(spoken)
         reply = "".join(collected)
         if not got_audio and not abort.is_set():
             if reply:

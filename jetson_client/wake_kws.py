@@ -23,6 +23,47 @@ def model_dir() -> str:
     return DEFAULT_MODEL_DIR
 
 
+def _python_tag() -> str:
+    return f"python{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def _path_matches_this_python(path: Path) -> bool:
+    blob = str(path)
+    found = [piece for piece in blob.split("/") if piece.startswith("python3.")]
+    if not found:
+        return True
+    return _python_tag() in found
+
+
+def _sherpa_search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    extra = (os.environ.get("VOICE_KWS_PYTHONPATH") or "").strip()
+    if extra:
+        dirs.append(Path(extra))
+    home_sp = Path.home() / "VoiceOnline" / ".venv_online" / "lib"
+    dirs.extend(sorted(home_sp.glob(f"{_python_tag()}/site-packages")))
+    try:
+        import site
+
+        user_site = site.getusersitepackages()
+        if user_site:
+            dirs.append(Path(user_site))
+    except Exception:
+        pass
+    dirs.append(Path.home() / ".local" / "lib" / _python_tag() / "site-packages")
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in dirs:
+        if not _path_matches_this_python(path):
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
 def _import_sherpa():
     try:
         import sherpa_onnx
@@ -30,13 +71,7 @@ def _import_sherpa():
         return sherpa_onnx
     except ImportError:
         pass
-    candidates: list[Path] = []
-    extra = (os.environ.get("VOICE_KWS_PYTHONPATH") or "").strip()
-    if extra:
-        candidates.append(Path(extra))
-    home_sp = Path.home() / "VoiceOnline" / ".venv_online" / "lib"
-    candidates.extend(sorted(home_sp.glob("python3.*/site-packages")))
-    for path in candidates:
+    for path in _sherpa_search_dirs():
         if not (path / "sherpa_onnx").is_dir():
             continue
         inserted = str(path)
@@ -71,8 +106,29 @@ def verify_keyword_tokens(tokens_path: str | Path, phrase: str = WAKE_WORD) -> l
     return list(KEYWORD_TOKENS)
 
 
+def keywords_score() -> float:
+    raw = os.environ.get("WAKE_KWS_SCORE", "2.0")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 2.0
+    return max(0.0, min(10.0, value))
+
+
+def keywords_threshold() -> float:
+    raw = os.environ.get("WAKE_KWS_THRESHOLD", "0.25")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.25
+    return max(0.0, min(1.0, value))
+
+
 def keyword_line(phrase: str = WAKE_WORD) -> str:
-    return " ".join(KEYWORD_TOKENS) + f" :2.0 #0.35 @{phrase.replace(' ', '')}"
+    return (
+        " ".join(KEYWORD_TOKENS)
+        + f" :{keywords_score():g} #{keywords_threshold():g} @{phrase.replace(' ', '')}"
+    )
 
 
 def pcm_s16le_to_float(pcm: bytes):
@@ -96,21 +152,41 @@ def pcm_rms(pcm: bytes) -> float:
     return float(np.sqrt(np.mean(np.square(samples))))
 
 
+def boost_for_kws(samples, *, target: float = 0.05, max_gain: float = 6.0, floor: float = 0.004):
+    """Raise quiet speech toward `target` RMS. Leave silence and loud speech alone."""
+    import numpy as np
+
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return audio, 0.0
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    if rms < floor or rms >= target:
+        return audio, rms
+    gain = min(float(max_gain), float(target) / rms)
+    return np.clip(audio * gain, -1.0, 1.0).astype(np.float32), rms
+
+
 class KwsCooldown:
     """Drop captured PCM after TTS so speaker echo cannot re-trigger wake."""
 
     def __init__(self, sec: float | None = None):
-        raw = os.environ.get("WAKE_COOLDOWN_SEC", "0.8") if sec is None else sec
+        raw = os.environ.get("WAKE_COOLDOWN_SEC", "1.2") if sec is None else sec
         try:
             self.sec = float(raw)
         except (TypeError, ValueError):
-            self.sec = 0.8
+            self.sec = 1.2
         if self.sec < 0:
             self.sec = 0.0
         self.left = 0
 
-    def arm(self) -> None:
-        self.left = int(self.sec * 16000 * 2)
+    def arm(self, extra_sec: float = 0.0) -> None:
+        try:
+            extra = float(extra_sec)
+        except (TypeError, ValueError):
+            extra = 0.0
+        if extra < 0:
+            extra = 0.0
+        self.left = int((self.sec + extra) * 16000 * 2)
 
     def allow(self, nbytes: int) -> bool:
         if self.left <= 0:
@@ -143,6 +219,8 @@ class KeywordSpotter:
             keywords_path.parent.mkdir(parents=True, exist_ok=True)
             keywords_path.write_text(expected + "\n", encoding="utf-8")
         self.model_path = str(base)
+        score = keywords_score()
+        threshold = keywords_threshold()
         self._spotter = sherpa_onnx.KeywordSpotter(
             tokens=str(files["tokens"]),
             encoder=str(files["encoder"]),
@@ -152,31 +230,66 @@ class KeywordSpotter:
             num_threads=int(num_threads),
             max_active_paths=4,
             num_trailing_blanks=2,
-            keywords_score=1.5,
-            keywords_threshold=0.35,
+            keywords_score=score,
+            keywords_threshold=threshold,
             sample_rate=16000,
             feature_dim=80,
             provider="cpu",
         )
         self._stream = self._spotter.create_stream()
+        self._voiced = False
+        self._tail_pending = False
+        self._quiet_samples = 0
+        self._need_quiet = int(0.28 * 16000)
+        self._tail_samples = int(0.40 * 16000)
+        self._speech_rms = 0.010
+        self._quiet_rms = 0.006
 
     def reset(self) -> None:
         self._spotter.reset_stream(self._stream)
+        self._voiced = False
+        self._tail_pending = False
+        self._quiet_samples = 0
+
+    def _decode(self) -> bool:
+        while self._spotter.is_ready(self._stream):
+            self._spotter.decode_stream(self._stream)
+            keyword = (self._spotter.get_result(self._stream) or "").replace(" ", "")
+            if keyword and (keyword == self.word or self.word in keyword):
+                self.reset()
+                return True
+        return False
+
+    def _feed(self, samples, sample_rate: int) -> bool:
+        if samples is None or getattr(samples, "size", 0) == 0:
+            return False
+        self._stream.accept_waveform(sample_rate, samples)
+        return self._decode()
 
     def accept_pcm(self, pcm: bytes, sample_rate: int = 16000) -> bool:
         if sample_rate != 16000:
             raise ValueError("wake-word audio must be 16 kHz")
         samples = pcm_s16le_to_float(pcm)
-        if samples.size == 0:
-            return False
-        hop = max(1, int(0.1 * sample_rate))
-        for start in range(0, int(samples.size), hop):
-            self._stream.accept_waveform(sample_rate, samples[start : start + hop])
-            while self._spotter.is_ready(self._stream):
-                self._spotter.decode_stream(self._stream)
-                keyword = (self._spotter.get_result(self._stream) or "").replace(" ", "")
-                if keyword and (keyword == self.word or self.word in keyword):
-                    self.reset()
+        samples, _raw_rms = boost_for_kws(samples)
+        if self._feed(samples, sample_rate):
+            return True
+        rms = 0.0
+        if getattr(samples, "size", 0):
+            import numpy as np
+
+            rms = float(np.sqrt(np.mean(np.square(samples))))
+        if rms >= self._speech_rms:
+            self._voiced = True
+            self._quiet_samples = 0
+            self._tail_pending = True
+        elif self._voiced and rms < self._quiet_rms:
+            self._quiet_samples += int(getattr(samples, "size", 0) or 0)
+            if self._tail_pending and self._quiet_samples >= self._need_quiet:
+                import numpy as np
+
+                self._tail_pending = False
+                tail = np.zeros(self._tail_samples, dtype=np.float32)
+                if self._feed(tail, sample_rate):
                     return True
         return False
 

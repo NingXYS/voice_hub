@@ -37,8 +37,17 @@ if [ -z "${VOICE_HUB_BRIDGE_PATH:-}" ]; then
     export VOICE_HUB_BRIDGE_PATH=/home/ning/model/lyz/src/tianlian_voice_bridge
   fi
 fi
+PYTHON_BIN=python3
+if [ -x "$ROOT/.venv/bin/python" ]; then
+  PYTHON_BIN="$ROOT/.venv/bin/python"
+fi
+PY_TAG="$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 if [ -z "${VOICE_KWS_PYTHONPATH:-}" ]; then
-  for cand in "$HOME/VoiceOnline/.venv_online/lib"/python3.*/site-packages "$ROOT/.venv/lib"/python3.*/site-packages; do
+  for cand in \
+    "$HOME/VoiceOnline/.venv_online/lib/$PY_TAG/site-packages" \
+    "$ROOT/.venv/lib/$PY_TAG/site-packages" \
+    "$HOME/.local/lib/$PY_TAG/site-packages"
+  do
     if [ -d "$cand/sherpa_onnx" ]; then
       export VOICE_KWS_PYTHONPATH="$cand"
       break
@@ -54,10 +63,5 @@ fi
 export PYTHONPATH="$ROOT${VOICE_HUB_BRIDGE_PATH:+:${VOICE_HUB_BRIDGE_PATH}}:${PYTHONPATH:-}"
 if [ -n "${VOICE_KWS_PYTHONPATH:-}" ]; then
   export PYTHONPATH="${VOICE_KWS_PYTHONPATH}:${PYTHONPATH}"
-fi
-
-PYTHON_BIN=python3
-if [ -x "$ROOT/.venv/bin/python" ]; then
-  PYTHON_BIN="$ROOT/.venv/bin/python"
 fi
 exec "$PYTHON_BIN" "$ROOT/jetson_client/voice_client.py" "$@"

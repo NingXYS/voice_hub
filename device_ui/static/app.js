@@ -623,7 +623,13 @@ function downsample(input, fromRate, toRate) {
   const ratio = fromRate / toRate;
   const n = Math.floor(input.length / ratio);
   const out = new Float32Array(n);
-  for (let i = 0; i < n; i += 1) out[i] = input[Math.min(input.length - 1, Math.floor(i * ratio))];
+  for (let i = 0; i < n; i += 1) {
+    const src = i * ratio;
+    const i0 = Math.floor(src);
+    const i1 = Math.min(input.length - 1, i0 + 1);
+    const frac = src - i0;
+    out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+  }
   return out;
 }
 
@@ -644,12 +650,23 @@ function rms(f32) {
 
 async function startCapture(onFrame) {
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    audio: {
+      channelCount: 1,
+      sampleRate: { ideal: 16000 },
+      echoCancellation: true,
+      noiseSuppression: false,
+      autoGainControl: true,
+    },
   });
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let ctx;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  } catch (err) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+  }
   if (ctx.state === "suspended") await ctx.resume();
   const source = ctx.createMediaStreamSource(stream);
-  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const proc = ctx.createScriptProcessor(2048, 1, 1);
   proc.onaudioprocess = (ev) => {
     const input = ev.inputBuffer.getChannelData(0);
     const resampled = downsample(input, ctx.sampleRate, 16000);
@@ -692,7 +709,7 @@ async function startConversation() {
   let silenceMs = 0;
   let voicedMs = 0;
   let recStarted = 0;
-  const SILENCE_END = 800;
+  const SILENCE_END = 550;
   const MIN_SPEECH = 200;
   const MAX_UTTER = 12000;
   const ECHO_TAIL = 400;
@@ -750,8 +767,9 @@ async function startConversation() {
       voiceWs.onerror = () => reject(new Error("ws"));
     });
     capture = await startCapture((bytes, energy) => {
-      if (!conversation || talkPhase === "playing" || talkPhase === "waiting") return;
+      if (!conversation) return;
       if (voiceWs && voiceWs.readyState === 1) voiceWs.send(bytes);
+      if (talkPhase === "playing" || talkPhase === "waiting") return;
       if (!wakeArmed) return;
       const now = performance.now();
       const dt = 1000 * (bytes.length / 2) / 16000;
@@ -800,6 +818,7 @@ async function startConversation() {
       }
       if (evj.type === "wake" && evj.status === "hit") {
         clearReplyTimer();
+        if (activePlayer) activePlayer.stop();
         wakeArmed = true;
         recording = true;
         voiced = false;
@@ -838,6 +857,7 @@ async function startConversation() {
         if ((evj.message || "").includes("连")) setLamp(false, "未连接");
       }
       if (evj.type === "turn_end" && conversation) {
+        if (talkPhase === "recording") return;
         clearReplyTimer();
         const wait = player.playbackDone ? player.playbackDone() : Promise.resolve();
         await wait;
@@ -845,7 +865,7 @@ async function startConversation() {
         pendingMs = 0;
         recording = false;
         wakeArmed = false;
-        if (conversation) {
+        if (conversation && talkPhase !== "recording") {
           setPhase("listening", "等待「小溪小溪」");
           setMsg("可以说下一次「小溪小溪」。", true);
         }
