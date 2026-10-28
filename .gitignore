@@ -4,3 +4,15 @@ __pycache__/
 .env
 *.egg-info/
 .pytest_cache/
+
+# Runtime / private data
+runtime_data/
+logs/
+.runtime/
+*.flac
+
+# Secrets
+.env.*
+*.key
+*.pem
+secrets/
